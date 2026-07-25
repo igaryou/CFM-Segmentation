@@ -46,6 +46,35 @@ class TinyEndpointModel(nn.Module):
         return logits, torch.softmax(logits, dim=1)
 
 
+class AmpEndpointModel(nn.Module):
+    """Small model whose convolution and time projection autocast predictably."""
+
+    def __init__(self, num_classes: int) -> None:
+        super().__init__()
+        self.state_encoder = nn.Conv2d(num_classes, num_classes, 1)
+        self.image_encoder = nn.Conv2d(3, num_classes, 1)
+        self.time_projection = nn.Linear(2, num_classes, bias=False)
+
+    def encode_image(self, image: torch.Tensor) -> torch.Tensor:
+        return self.image_encoder(image)
+
+    def forward_logits_with_image_feat(self, x_s, image_feat, s, t):
+        time_feat = self.time_projection(torch.stack((s, t), dim=1))
+        return (
+            self.state_encoder(x_s)
+            + image_feat
+            + time_feat[:, :, None, None]
+        )
+
+    def forward_logits(self, x_s, image, s, t):
+        return self.forward_logits_with_image_feat(
+            x_s,
+            self.encode_image(image),
+            s,
+            t,
+        )
+
+
 class ConstantEndpointModel(nn.Module):
     def __init__(self, num_classes: int) -> None:
         super().__init__()
@@ -165,6 +194,133 @@ def test_consistency_losses_are_scalar_finite_and_backward(tiny_case, loss_type)
     ]
     assert finite_grads
     assert any(float(grad.abs().sum()) > 0.0 for grad in finite_grads)
+
+
+def _assert_finite_nonzero_gradient(parameter: nn.Parameter) -> None:
+    assert parameter.grad is not None
+    assert torch.isfinite(parameter.grad).all()
+    assert float(parameter.grad.abs().sum()) > 0.0
+
+
+def _run_ecld_gradient_audit(
+    *,
+    device: torch.device,
+    amp_ecld: bool,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    torch.manual_seed(31)
+    classes = 4
+    model = AmpEndpointModel(classes).to(device)
+    source_generator = nn.Conv2d(3, classes, 1).to(device)
+    cfm = CategoricalFlowMaps(
+        num_classes=classes,
+        eps=0.05,
+        label_smoothing=0.0,
+        device=device,
+    )
+    image = torch.randn(2, 3, 4, 3, device=device)
+    source_input = torch.randn(2, 3, 4, 3, device=device)
+    s = torch.tensor([0.12, 0.28], device=device)
+    t = torch.tensor([0.73, 0.81], device=device)
+
+    if amp_ecld:
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+        ):
+            x_s = source_generator(source_input)
+            image_feat = model.encode_image(image)
+    else:
+        x_s = source_generator(source_input)
+        image_feat = model.encode_image(image)
+
+    loss, stats = compute_consistency_loss(
+        "ecld",
+        cfm=cfm,
+        model=model,
+        image=image,
+        image_feat=image_feat,
+        x_s=x_s,
+        s=s,
+        t=t,
+        amp_ecld=amp_ecld,
+        amp_dtype=torch.bfloat16 if amp_ecld else None,
+        debug=True,
+    )
+    loss.backward()
+
+    _assert_finite_nonzero_gradient(model.state_encoder.weight)
+    _assert_finite_nonzero_gradient(model.image_encoder.weight)
+    _assert_finite_nonzero_gradient(source_generator.weight)
+    return loss, stats
+
+
+def test_ecld_fp32_preserves_gradient_paths_and_dtypes():
+    loss, stats = _run_ecld_gradient_audit(
+        device=torch.device("cpu"),
+        amp_ecld=False,
+    )
+    assert loss.dtype == torch.float32
+    assert torch.isfinite(loss)
+    for key in (
+        "ecld_debug_student_logits",
+        "ecld_debug_dlogits_dt",
+        "ecld_debug_student_prob",
+        "ecld_debug_student_log_prob",
+        "ecld_debug_dprob_dt",
+        "ecld_debug_teacher_logits",
+        "ecld_debug_teacher_prob",
+        "loss_ecld_ec",
+        "loss_ecld_td",
+    ):
+        assert stats[key].dtype == torch.float32
+
+
+def test_ecld_cpu_fp16_request_safely_falls_back_to_fp32(tiny_case):
+    model, cfm, image, x_s, s, _, t = tiny_case
+    loss, stats = compute_consistency_loss(
+        "ecld",
+        cfm=cfm,
+        model=model,
+        image=image,
+        image_feat=model.encode_image(image),
+        x_s=x_s,
+        s=s,
+        t=t,
+        amp_ecld=True,
+        amp_dtype=torch.float16,
+        debug=True,
+    )
+    loss.backward()
+    assert loss.dtype == torch.float32
+    assert stats["ecld_debug_student_logits"].dtype == torch.float32
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(),
+    reason="CUDA bf16 is required",
+)
+def test_ecld_bf16_preserves_gradient_paths_and_mixed_dtypes():
+    loss, stats = _run_ecld_gradient_audit(
+        device=torch.device("cuda"),
+        amp_ecld=True,
+    )
+    assert loss.dtype == torch.float32
+    assert torch.isfinite(loss)
+    for key in (
+        "ecld_debug_student_logits",
+        "ecld_debug_dlogits_dt",
+        "ecld_debug_teacher_logits",
+    ):
+        assert stats[key].dtype == torch.bfloat16
+    for key in (
+        "ecld_debug_student_prob",
+        "ecld_debug_student_log_prob",
+        "ecld_debug_dprob_dt",
+        "ecld_debug_teacher_prob",
+        "loss_ecld_ec",
+        "loss_ecld_td",
+    ):
+        assert stats[key].dtype == torch.float32
 
 
 def test_psd_common_interface_is_exact_legacy_regression(tiny_case):
@@ -336,6 +492,7 @@ def test_cli_defaults_and_legacy_priority():
     assert config["consistency_weight"] == 1.0
     assert config["ecld_ec_weight"] == 4.0
     assert config["ecld_td_weight"] == 2.0
+    assert config["amp_ecld"] is False
 
     legacy_args = normalize_args(
         parser.parse_args(

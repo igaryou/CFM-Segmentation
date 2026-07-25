@@ -36,6 +36,23 @@ def _autocast_disabled(tensor: torch.Tensor):
     return nullcontext()
 
 
+def _autocast_enabled(
+    tensor: torch.Tensor,
+    dtype: Optional[torch.dtype],
+):
+    if dtype is None or tensor.device.type not in {"cpu", "cuda"}:
+        return nullcontext()
+    if dtype not in {torch.bfloat16, torch.float16}:
+        raise ValueError(f"Unsupported ECLD AMP dtype: {dtype}")
+    if tensor.device.type == "cpu" and dtype != torch.bfloat16:
+        return nullcontext()
+    return torch.autocast(
+        device_type=tensor.device.type,
+        dtype=dtype,
+        enabled=True,
+    )
+
+
 def _forward_logits(
     model,
     x: torch.Tensor,
@@ -178,7 +195,33 @@ def _csd_loss(
     )
 
 
-def _ecld_loss(
+def _ecld_debug_dtype_stats(
+    *,
+    student_logits: torch.Tensor,
+    dlogits_dt: torch.Tensor,
+    student_prob: torch.Tensor,
+    student_log_prob: torch.Tensor,
+    dprob_dt: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    teacher_prob: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    """Return scalar probes whose dtypes can be asserted in debug tests."""
+    tensors = {
+        "ecld_debug_student_logits": student_logits,
+        "ecld_debug_dlogits_dt": dlogits_dt,
+        "ecld_debug_student_prob": student_prob,
+        "ecld_debug_student_log_prob": student_log_prob,
+        "ecld_debug_dprob_dt": dprob_dt,
+        "ecld_debug_teacher_logits": teacher_logits,
+        "ecld_debug_teacher_prob": teacher_prob,
+    }
+    return {
+        name: tensor.detach().new_zeros(())
+        for name, tensor in tensors.items()
+    }
+
+
+def _ecld_loss_fp32(
     *,
     cfm,
     model,
@@ -194,7 +237,7 @@ def _ecld_loss(
     time_weighting: str,
     debug: bool,
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Categorical Flow Maps, Eqs. (16), (18), and (19)."""
+    """Original full-FP32 ECLD path kept for numerical compatibility."""
     with _autocast_disabled(x_s):
         x_s_fp32 = x_s.float()
         image_fp32 = image.float()
@@ -258,8 +301,18 @@ def _ecld_loss(
         dt_prob_norm = dprob_dt.square().sum(dim=1).sqrt().mean()
         loss_ecld = ec_weight * loss_ec + td_weight * loss_td
 
+    debug_dtype_stats = {}
     if debug:
         _validate_probability("ECLD teacher", teacher_prob)
+        debug_dtype_stats = _ecld_debug_dtype_stats(
+            student_logits=student_logits,
+            dlogits_dt=dlogits_dt,
+            student_prob=student_prob,
+            student_log_prob=student_log_prob,
+            dprob_dt=dprob_dt,
+            teacher_logits=teacher_logits,
+            teacher_prob=teacher_prob,
+        )
     _finite_or_raise(
         "ecld",
         loss_ecld,
@@ -279,7 +332,187 @@ def _ecld_loss(
         ecld_dt_prob_norm=dt_prob_norm,
         loss_ce_ec=loss_ec,
         loss_td=loss_td,
+        **debug_dtype_stats,
     )
+
+
+def _ecld_loss_amp(
+    *,
+    cfm,
+    model,
+    image: torch.Tensor,
+    x_s: torch.Tensor,
+    s: torch.Tensor,
+    t: torch.Tensor,
+    image_feat: Optional[torch.Tensor],
+    eps: float,
+    time_eps: float,
+    ec_weight: float,
+    td_weight: float,
+    time_weighting: str,
+    amp_dtype: torch.dtype,
+    debug: bool,
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """ECLD with AMP model/JVP forwards and FP32 probabilities/losses."""
+    s_fp32 = s.float()
+    t_fp32 = t.float()
+
+    with _autocast_enabled(x_s, amp_dtype):
+        def logits_at(t_in: torch.Tensor) -> torch.Tensor:
+            logits = _forward_logits(
+                model,
+                x_s,
+                image,
+                s_fp32,
+                t_in,
+                image_feat,
+            )
+            return logits.to(dtype=amp_dtype)
+
+        student_logits, dlogits_dt = jvp(
+            logits_at,
+            (t_fp32,),
+            (torch.ones_like(t_fp32),),
+        )
+
+    with _autocast_disabled(x_s):
+        student_logits_fp32 = student_logits.float()
+        dlogits_dt_fp32 = dlogits_dt.float()
+        student_log_prob = F.log_softmax(student_logits_fp32, dim=1)
+        student_prob = student_log_prob.exp()
+
+        # Exact softmax JVP in FP32, without constructing a full Jacobian.
+        prob_dot_logits = (
+            student_prob * dlogits_dt_fp32
+        ).sum(dim=1, keepdim=True)
+        dprob_dt = student_prob * (
+            dlogits_dt_fp32 - prob_dot_logits
+        )
+
+        # Keep this FP32 transport for the student-side objective. Only the
+        # detached teacher input is converted back to the model AMP dtype.
+        x_st = cfm.flow_map(x_s, student_prob, s_fp32, t_fp32)
+        x_st_teacher = x_st.detach().to(dtype=amp_dtype)
+
+    with torch.no_grad():
+        detached_feat = image_feat.detach() if image_feat is not None else None
+        with _autocast_enabled(x_s, amp_dtype):
+            teacher_logits = _forward_logits(
+                model,
+                x_st_teacher,
+                image,
+                t_fp32,
+                t_fp32,
+                detached_feat,
+            ).to(dtype=amp_dtype)
+
+        with _autocast_disabled(x_s):
+            teacher_prob = _normalize_probability(
+                torch.softmax(teacher_logits.float(), dim=1),
+                eps,
+            )
+
+    with _autocast_disabled(x_s):
+        loss_ec_pixel = -(teacher_prob * student_log_prob).sum(dim=1)
+        if time_weighting == "none":
+            temporal_weight = torch.ones_like(t_fp32)
+        elif time_weighting == "inverse_square":
+            temporal_weight = (1.0 - t_fp32).clamp_min(time_eps).pow(-2)
+        else:
+            raise ValueError(f"Unknown ECLD time weighting: {time_weighting}")
+        loss_ec = (
+            loss_ec_pixel * temporal_weight[:, None, None]
+        ).mean()
+
+        gamma = cfm.gamma(s_fp32, t_fp32)
+        loss_td = (
+            gamma.square()[:, None, None]
+            * dprob_dt.square().sum(dim=1)
+        ).mean()
+        dt_prob_norm = dprob_dt.square().sum(dim=1).sqrt().mean()
+        loss_ecld = (
+            ec_weight * loss_ec + td_weight * loss_td
+        ).float()
+
+    debug_dtype_stats = {}
+    if debug:
+        _validate_probability("ECLD teacher", teacher_prob)
+        debug_dtype_stats = _ecld_debug_dtype_stats(
+            student_logits=student_logits,
+            dlogits_dt=dlogits_dt,
+            student_prob=student_prob,
+            student_log_prob=student_log_prob,
+            dprob_dt=dprob_dt,
+            teacher_logits=teacher_logits,
+            teacher_prob=teacher_prob,
+        )
+    _finite_or_raise(
+        "ecld",
+        loss_ecld,
+        s=s,
+        t=t,
+        diagnostics={
+            "loss_ecld_ec": loss_ec,
+            "loss_ecld_td": loss_td,
+            "ecld_dt_prob_norm": dt_prob_norm,
+        },
+    )
+    return loss_ecld, _detached_stats(
+        loss_ecld,
+        loss_ecld=loss_ecld,
+        loss_ecld_ec=loss_ec,
+        loss_ecld_td=loss_td,
+        ecld_dt_prob_norm=dt_prob_norm,
+        loss_ce_ec=loss_ec,
+        loss_td=loss_td,
+        **debug_dtype_stats,
+    )
+
+
+def _ecld_loss(
+    *,
+    cfm,
+    model,
+    image: torch.Tensor,
+    x_s: torch.Tensor,
+    s: torch.Tensor,
+    t: torch.Tensor,
+    image_feat: Optional[torch.Tensor],
+    eps: float,
+    time_eps: float,
+    ec_weight: float,
+    td_weight: float,
+    time_weighting: str,
+    amp_ecld: bool = False,
+    amp_dtype: Optional[torch.dtype] = None,
+    debug: bool,
+) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Categorical Flow Maps ECLD, Eqs. (16), (18), and (19)."""
+    common = {
+        "cfm": cfm,
+        "model": model,
+        "image": image,
+        "x_s": x_s,
+        "s": s,
+        "t": t,
+        "image_feat": image_feat,
+        "eps": eps,
+        "time_eps": time_eps,
+        "ec_weight": ec_weight,
+        "td_weight": td_weight,
+        "time_weighting": time_weighting,
+        "debug": debug,
+    }
+    amp_device_supported = (
+        x_s.device.type == "cuda"
+        or (x_s.device.type == "cpu" and amp_dtype == torch.bfloat16)
+    )
+    if amp_ecld and amp_dtype is not None and amp_device_supported:
+        return _ecld_loss_amp(
+            **common,
+            amp_dtype=amp_dtype,
+        )
+    return _ecld_loss_fp32(**common)
 
 
 def _esd_loss(
@@ -437,6 +670,8 @@ def compute_consistency_loss(
     ecld_ec_weight: float = 4.0,
     ecld_td_weight: float = 2.0,
     ecld_time_weighting: str = "none",
+    amp_ecld: bool = False,
+    amp_dtype: Optional[torch.dtype] = None,
     debug: bool = False,
 ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Common loss interface; class probabilities always use dim=1."""
@@ -494,6 +729,8 @@ def compute_consistency_loss(
             ec_weight=ecld_ec_weight,
             td_weight=ecld_td_weight,
             time_weighting=ecld_time_weighting,
+            amp_ecld=amp_ecld,
+            amp_dtype=amp_dtype,
             debug=debug,
         )
     elif loss_type == "esd":

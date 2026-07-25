@@ -1126,6 +1126,12 @@ def train(args: argparse.Namespace) -> None:
                         ecld_ec_weight=args.ecld_ec_weight,
                         ecld_td_weight=args.ecld_td_weight,
                         ecld_time_weighting=args.ecld_time_weighting,
+                        amp_ecld=args.amp_ecld,
+                        amp_dtype=(
+                            get_amp_dtype(args)
+                            if args.amp and args.amp_ecld
+                            else None
+                        ),
                         debug=args.consistency_debug,
                     )
 

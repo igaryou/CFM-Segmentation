@@ -15,7 +15,7 @@ class CategoricalFlowMaps:
     def __init__(
         self,
         num_classes: int = 20,
-        eps: float = 0.05,
+        eps: float = 1e-5,
         label_smoothing: float = 0.1,
         device="cuda",
         prior_type: str = "gaussian",
