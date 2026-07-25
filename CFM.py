@@ -283,6 +283,10 @@ class CategoricalFlowMaps:
         flow_map gamma=(t-s)/(1-s) と整合する PSD teacher の混合係数．
 
         pi_st = lam * pi_su + (1 - lam) * pi_ut
+        lam = (1-t)(u-s) / ((1-u)(t-s)).
+
+        これは X_{s,t}=X_{u,t} o X_{s,u} に現在の endpoint
+        parametrisation を代入して pi_{s,t} について解いた係数である．
         """
         num = (1.0 - t) * (u - s)
         den = (1.0 - u).clamp_min(eps) * (t - s).clamp_min(eps)
@@ -298,6 +302,11 @@ class CategoricalFlowMaps:
           2. x_u から pi_ut を予測する
           3. pi_su と pi_ut の semigroup-consistent な混合を teacher にする
           4. 直接予測 pi_st を teacher に合わせる
+
+        後方互換のため，既存実装どおり全画素・全20クラス上の soft-target
+        cross entropy CE(target, pi_st) を使う．Discrete Flow Maps の forward
+        KL(target || pi_st) とは teacher entropy の定数分だけ異なるが，detach
+        した student 勾配は同じである．
         """
         def model_forward(x_in, s_in, t_in, feat):
             if feat is None:

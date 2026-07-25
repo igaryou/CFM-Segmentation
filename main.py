@@ -3,17 +3,20 @@ import copy
 import json
 import math
 import os
+import random
 import warnings
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from CFM import CategoricalFlowMaps
+from consistency_losses import compute_consistency_loss, sample_consistency_times
 from dataset import Cityscapes20ClassDataset
 from model import SegDiffModel, SegFormerSourceGenerator
 from model_segformer import SegDiffSegFormerModel
@@ -31,6 +34,20 @@ HISTORY_KEYS = [
     "loss_align",
     "weighted_var",
     "weighted_align",
+    "loss_psd",
+    "loss_csd",
+    "csd_residual_norm",
+    "loss_ecld",
+    "loss_ecld_ec",
+    "loss_ecld_td",
+    "ecld_dt_prob_norm",
+    "loss_esd",
+    "esd_log_arg_min",
+    "esd_clamp_ratio",
+    "esd_nonfinite_ratio",
+    "esd_teacher_entropy",
+    "esd_teacher_min",
+    "esd_teacher_max",
 ]
 PRIOR_LOG_KEYS = [
     "mu_abs",
@@ -65,6 +82,26 @@ RESUME_OVERRIDE_KEYS = {
     "val_eval_num_steps",
     "val_eval_batch_size",
 }
+CONSISTENCY_COMPONENT_KEYS = {
+    "none": (),
+    "psd": ("loss_psd",),
+    "csd": ("loss_csd", "csd_residual_norm"),
+    "ecld": (
+        "loss_ecld",
+        "loss_ecld_ec",
+        "loss_ecld_td",
+        "ecld_dt_prob_norm",
+    ),
+    "esd": (
+        "loss_esd",
+        "esd_log_arg_min",
+        "esd_clamp_ratio",
+        "esd_nonfinite_ratio",
+        "esd_teacher_entropy",
+        "esd_teacher_min",
+        "esd_teacher_max",
+    ),
+}
 
 
 def parse_int_tuple(value) -> tuple[int, ...]:
@@ -90,6 +127,16 @@ def parse_int_set(value) -> set[int]:
 
 def parse_wandb_tags(value: str) -> list[str]:
     return [tag.strip() for tag in value.split(",") if tag.strip()]
+
+
+def seed_everything(seed: Optional[int]) -> None:
+    if seed is None:
+        return
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def get_amp_dtype(args: argparse.Namespace):
@@ -210,6 +257,12 @@ def json_safe_config(args: argparse.Namespace, optimizer_summary=None) -> Dict[s
     config["val_eval_epochs"] = sorted(args.val_eval_epochs)
     config["eta_meaning"] = "vfm_loss_weight"
     config["distill_weight"] = 1.0 - args.eta
+    config["effective_consistency_weight"] = (
+        (1.0 - args.eta) * args.consistency_weight
+    )
+    config["resume_consistency_policy"] = (
+        "checkpoint config wins; resume override keys do not include consistency settings"
+    )
     config["use_ccdm_aug"] = bool(args.use_ccdm_aug)
     config["imagenet_normalize"] = bool(args.imagenet_normalize)
     config["grad_accum_steps"] = int(args.grad_accum_steps)
@@ -245,6 +298,20 @@ def merge_resume_config(args: argparse.Namespace, ckpt: Dict[str, object], resul
         return args
 
     cli_config = vars(args).copy()
+    for key in (
+        "consistency_loss",
+        "consistency_weight",
+        "ecld_ec_weight",
+        "ecld_td_weight",
+        "ecld_time_weighting",
+    ):
+        cli_value = cli_config.get(key)
+        if key in config and cli_value is not None and cli_value != config[key]:
+            warnings.warn(
+                f"Resume uses checkpoint {key}={config[key]!r}; "
+                f"ignoring CLI value {cli_value!r} under the existing resume policy.",
+                RuntimeWarning,
+            )
     merged = cli_config.copy()
     for key, value in config.items():
         if key in merged:
@@ -266,6 +333,60 @@ def resolve_project_simplex(args: argparse.Namespace) -> Optional[bool]:
 
 
 def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
+    legacy_loss = getattr(args, "distill_loss", None)
+    consistency_loss = getattr(args, "consistency_loss", None)
+    if consistency_loss is None:
+        consistency_loss = legacy_loss or "psd"
+    elif legacy_loss is not None and consistency_loss != legacy_loss:
+        warnings.warn(
+            "--consistency_loss takes precedence over deprecated --distill_loss "
+            f"({consistency_loss!r} != {legacy_loss!r}).",
+            RuntimeWarning,
+        )
+    args.consistency_loss = consistency_loss
+    # Keep the legacy config/checkpoint field as an alias for downstream tools.
+    args.distill_loss = consistency_loss
+
+    legacy_weight_arg = getattr(args, "lambda_distill", None)
+    legacy_weight = 1.0 if legacy_weight_arg is None else float(legacy_weight_arg)
+    consistency_weight = getattr(args, "consistency_weight", None)
+    if consistency_weight is None:
+        consistency_weight = legacy_weight
+    elif legacy_weight_arg is not None and consistency_weight != legacy_weight:
+        warnings.warn(
+            "--consistency_weight takes precedence over deprecated "
+            f"--lambda_distill ({consistency_weight} != {legacy_weight}).",
+            RuntimeWarning,
+        )
+    args.consistency_weight = float(consistency_weight)
+    args.lambda_distill = args.consistency_weight
+
+    legacy_td_arg = getattr(args, "lambda_td", None)
+    legacy_td_scale = 1.0 if legacy_td_arg is None else float(legacy_td_arg)
+    ecld_td_weight = getattr(args, "ecld_td_weight", None)
+    if ecld_td_weight is None:
+        ecld_td_weight = 2.0 * legacy_td_scale
+    elif legacy_td_arg is not None and ecld_td_weight != 2.0 * legacy_td_scale:
+        warnings.warn(
+            "--ecld_td_weight takes precedence over deprecated --lambda_td "
+            f"({ecld_td_weight} != 2 * {legacy_td_scale}).",
+            RuntimeWarning,
+        )
+    args.ecld_td_weight = float(ecld_td_weight)
+    args.lambda_td = args.ecld_td_weight / 2.0
+    ecld_ec_weight = getattr(args, "ecld_ec_weight", None)
+    args.ecld_ec_weight = 4.0 if ecld_ec_weight is None else float(ecld_ec_weight)
+    args.ecld_time_weighting = (
+        getattr(args, "ecld_time_weighting", None) or "none"
+    )
+    args.consistency_eps = float(getattr(args, "consistency_eps", 1e-6))
+    args.consistency_time_eps = float(
+        getattr(args, "consistency_time_eps", 1e-4)
+    )
+    args.consistency_debug = bool(getattr(args, "consistency_debug", False))
+    if args.consistency_loss not in {"none", "psd", "csd", "ecld", "esd"}:
+        raise ValueError(f"Unknown consistency loss: {args.consistency_loss}")
+
     args.root = os.path.expanduser(args.root)
     args.image_size = parse_int_tuple(args.image_size)
     if getattr(args, "crop_size", None) is not None:
@@ -294,6 +415,9 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
     args.max_iters = getattr(args, "max_iters", None)
     if args.max_iters is not None:
         args.max_iters = int(args.max_iters)
+    args.seed = getattr(args, "seed", None)
+    if args.seed is not None:
+        args.seed = int(args.seed)
     args.grad_accum_steps = int(getattr(args, "grad_accum_steps", 1))
     args.lr_mid_epoch = getattr(args, "lr_mid_epoch", None)
     if args.lr_mid_epoch is not None:
@@ -316,6 +440,12 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("--max_iters must be positive")
     if args.grad_accum_steps < 1:
         raise ValueError("--grad_accum_steps must be >= 1")
+    if args.consistency_weight < 0.0:
+        raise ValueError("--consistency_weight must be non-negative")
+    if args.ecld_ec_weight < 0.0 or args.ecld_td_weight < 0.0:
+        raise ValueError("ECLD component weights must be non-negative")
+    if args.consistency_eps <= 0.0 or args.consistency_time_eps <= 0.0:
+        raise ValueError("Consistency eps values must be positive")
     if args.lr_mid_epoch is not None:
         if not (args.warmup_epochs < args.lr_mid_epoch < args.epochs):
             raise ValueError("--lr_mid_epoch must satisfy warmup_epochs < lr_mid_epoch < epochs")
@@ -536,10 +666,14 @@ def build_scheduler(args: argparse.Namespace, optimizer, resume: bool):
 def init_history(saved=None) -> Dict[str, list[float]]:
     history = {key: [] for key in HISTORY_KEYS}
     if isinstance(saved, dict):
+        saved_length = len(saved.get("loss", []))
         for key in HISTORY_KEYS:
-            history[key] = list(saved.get(key, []))
+            history[key] = list(saved.get(key, [0.0] * saved_length))
     elif isinstance(saved, list):
         history["loss"] = list(saved)
+        for key in HISTORY_KEYS:
+            if key != "loss":
+                history[key] = [0.0] * len(saved)
     return history
 
 
@@ -603,6 +737,17 @@ def init_wandb(args: argparse.Namespace, config: Dict[str, object]):
 
 def tensor_item(value: torch.Tensor) -> float:
     return float(value.detach().cpu().item())
+
+
+def consistency_component_payload(
+    prefix: str,
+    loss_type: str,
+    metrics: Dict[str, float],
+) -> Dict[str, float]:
+    return {
+        f"{prefix}/{key}": metrics[key]
+        for key in CONSISTENCY_COMPONENT_KEYS[loss_type]
+    }
 
 
 class SegmentationMetrics:
@@ -815,6 +960,7 @@ def train(args: argparse.Namespace) -> None:
         args = merge_resume_config(args, ckpt, result_dir)
 
     args = normalize_args(args)
+    seed_everything(args.seed)
     model = build_model(args)
     source_net = build_source_net(args)
     cfm = build_cfm(args)
@@ -867,6 +1013,10 @@ def train(args: argparse.Namespace) -> None:
         color_jitter_hue=args.color_jitter_hue,
         imagenet_normalize=args.imagenet_normalize,
     )
+    loader_generator = None
+    if args.seed is not None:
+        loader_generator = torch.Generator()
+        loader_generator.manual_seed(args.seed)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -874,6 +1024,7 @@ def train(args: argparse.Namespace) -> None:
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        generator=loader_generator,
     )
 
     global_step = 0
@@ -881,6 +1032,8 @@ def train(args: argparse.Namespace) -> None:
     last_epoch = start_epoch - 1
     stop_training = False
     vis_epochs = {10, 30, 50, 70, 90, 110, 130}
+    if DEVICE == "cuda":
+        torch.cuda.reset_peak_memory_stats()
     try:
         for epoch in range(start_epoch, end_epoch):
             model.train()
@@ -952,54 +1105,36 @@ def train(args: argparse.Namespace) -> None:
                         image_feat=image_feat
                     )
 
-                    if args.distill_loss == "psd":
-                        times = torch.rand(B, 3, device=DEVICE)
-                        times, _ = torch.sort(times, dim=1)
-
-                        s = times[:, 0]
-                        u = times[:, 1]
-                        t = times[:, 2]
-
-                        x_s = cfm.path(x0, x_1, s)
-                        
-                        
-                        loss_distill, distill_stats = cfm.psd_loss(
-                            model=model,
-                            x_s=x_s,
-                            img=img,
-                            s=s,
-                            u=u,
-                            t=t,
-                            image_feat=image_feat,
-                        )
-
-                    elif args.distill_loss == "ecld":
-                        a = torch.rand(B, device=DEVICE)
-                        b = torch.rand(B, device=DEVICE)
-                        s = torch.minimum(a, b)
-                        t = torch.maximum(a, b)
-
-                        x_s = cfm.path(x0, x_1, s)
-
-                        loss_distill, distill_stats = cfm.ecld_loss(
-                            model=model,
-                            x_s=x_s,
-                            img=img,
-                            s=s,
-                            t=t,
-                            lambda_td=args.lambda_td,
-                            image_feat=image_feat,
-                        )
-
-                    else:
-                        raise ValueError(f"Unknown distill_loss: {args.distill_loss}")
+                    s, u, t = sample_consistency_times(
+                        args.consistency_loss,
+                        B,
+                        device=DEVICE,
+                    )
+                    x_s = cfm.path(x0, x_1, s)
+                    loss_distill, distill_stats = compute_consistency_loss(
+                        args.consistency_loss,
+                        cfm=cfm,
+                        model=model,
+                        image=img,
+                        x_s=x_s,
+                        s=s,
+                        u=u,
+                        t=t,
+                        image_feat=image_feat,
+                        eps=args.consistency_eps,
+                        time_eps=args.consistency_time_eps,
+                        ecld_ec_weight=args.ecld_ec_weight,
+                        ecld_td_weight=args.ecld_td_weight,
+                        ecld_time_weighting=args.ecld_time_weighting,
+                        debug=args.consistency_debug,
+                    )
 
                     loss_inf = loss_inf.float()
                     loss_distill = loss_distill.float()
 
                     loss_base = (
                         args.eta * loss_inf
-                        + (1.0 - args.eta) * args.lambda_distill * loss_distill
+                        + (1.0 - args.eta) * args.consistency_weight * loss_distill
                     )
 
                     loss_var = prior_stats["loss_var"].float()
@@ -1048,6 +1183,12 @@ def train(args: argparse.Namespace) -> None:
                     "weighted_var": tensor_item(weighted_var),
                     "weighted_align": tensor_item(weighted_align),
                 }
+                zero_consistency_stat = torch.zeros_like(loss_distill.detach())
+                for key in HISTORY_KEYS:
+                    if key not in batch_metrics:
+                        batch_metrics[key] = tensor_item(
+                            distill_stats.get(key, zero_consistency_stat)
+                        )
 
                 for key in PRIOR_LOG_KEYS:
                     batch_metrics[key] = tensor_item(prior_stats[key])
@@ -1058,8 +1199,7 @@ def train(args: argparse.Namespace) -> None:
                 cnt += 1
 
                 if wandb is not None and args.wandb_log_interval > 0 and global_step % args.wandb_log_interval == 0:
-                    wandb.log(
-                        {
+                    batch_payload = {
                             "batch/loss": batch_metrics["loss"],
                             "batch/loss_base": batch_metrics["loss_base"],
                             "batch/loss_inf": batch_metrics["inf"],
@@ -1068,14 +1208,26 @@ def train(args: argparse.Namespace) -> None:
                             "batch/loss_td": batch_metrics["td"],
                             "batch/loss_var": batch_metrics["loss_var"],
                             "batch/loss_align": batch_metrics["loss_align"],
-                            "batch/distill_loss_type": args.distill_loss,
+                            "batch/distill_loss_type": args.consistency_loss,
+                            "batch/loss_total": batch_metrics["loss"],
+                            "batch/loss_primary": batch_metrics["inf"],
+                            "batch/loss_consistency": batch_metrics["distill"],
+                            "batch/consistency_weight": args.consistency_weight,
+                            "batch/consistency_loss_type": args.consistency_loss,
                             "batch/grad_accum_steps": args.grad_accum_steps,
                             "batch/effective_batch_size": args.batch_size * args.grad_accum_steps,
                             "batch/accum_steps_this_update": accum_steps_this_update,
                             "global_step": global_step,
                             "optimizer_step": optimizer_step,
-                        }
+                    }
+                    batch_payload.update(
+                        consistency_component_payload(
+                            "batch",
+                            args.consistency_loss,
+                            batch_metrics,
+                        )
                     )
+                    wandb.log(batch_payload)
                 global_step += 1
                 if will_stop_after_this_batch:
                     stop_training = True
@@ -1089,13 +1241,23 @@ def train(args: argparse.Namespace) -> None:
                 history[key].append(avg[key])
 
             current_lr = optimizer.param_groups[0]["lr"]
+            peak_gpu_memory_mb = (
+                torch.cuda.max_memory_allocated() / (1024 ** 2)
+                if DEVICE == "cuda"
+                else 0.0
+            )
             log_line = (
                 f"epoch:{epoch + 1} "
                 f"loss_avg:{avg['loss']:.6f} "
                 f"loss_base:{avg['loss_base']:.6f} "
                 f"inf:{avg['inf']:.6f} "
                 f"distill:{avg['distill']:.6f} "
-                f"distill_type:{args.distill_loss} "
+                f"loss_total:{avg['loss']:.6f} "
+                f"loss_primary:{avg['inf']:.6f} "
+                f"loss_consistency:{avg['distill']:.6f} "
+                f"distill_type:{args.consistency_loss} "
+                f"consistency_loss_type:{args.consistency_loss} "
+                f"consistency_weight:{args.consistency_weight:.6f} "
                 f"ce_ec:{avg['ce_ec']:.6f} "
                 f"td:{avg['td']:.6f} "
                 f"loss_var:{avg['loss_var']:.6f} "
@@ -1112,22 +1274,29 @@ def train(args: argparse.Namespace) -> None:
                 f"grad_accum_steps:{args.grad_accum_steps} "
                 f"effective_batch_size:{args.batch_size * args.grad_accum_steps} "
                 f"optimizer_step:{optimizer_step} "
+                f"peak_gpu_memory_mb:{peak_gpu_memory_mb:.1f} "
                 f"lr:{current_lr:.8e}"
             )
+            for key in CONSISTENCY_COMPONENT_KEYS[args.consistency_loss]:
+                log_line += f" {key}:{avg[key]:.6f}"
             print(log_line)
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(log_line + "\n")
 
             if wandb is not None:
-                wandb.log(
-                    {
+                train_payload = {
                         "train/loss": avg["loss"],
                         "train/loss_base": avg["loss_base"],
                         "train/loss_inf": avg["inf"],
                         "train/loss_distill": avg["distill"],
-                        "train/distill_loss_type": args.distill_loss,
+                        "train/distill_loss_type": args.consistency_loss,
                         "train/loss_ce_ec": avg["ce_ec"],
                         "train/loss_td": avg["td"],
+                        "train/loss_total": avg["loss"],
+                        "train/loss_primary": avg["inf"],
+                        "train/loss_consistency": avg["distill"],
+                        "train/consistency_weight": args.consistency_weight,
+                        "train/consistency_loss_type": args.consistency_loss,
                         "train/loss_var": avg["loss_var"],
                         "train/loss_align": avg["loss_align"],
                         "train/weighted_var": avg["weighted_var"],
@@ -1142,10 +1311,18 @@ def train(args: argparse.Namespace) -> None:
                         "train/x1_abs": avg["x1_abs"],
                         "train/grad_accum_steps": args.grad_accum_steps,
                         "train/effective_batch_size": args.batch_size * args.grad_accum_steps,
+                        "train/peak_gpu_memory_mb": peak_gpu_memory_mb,
                         "epoch": epoch + 1,
                         "optimizer_step": optimizer_step,
-                    }
+                }
+                train_payload.update(
+                    consistency_component_payload(
+                        "train",
+                        args.consistency_loss,
+                        avg,
+                    )
                 )
+                wandb.log(train_payload)
 
             scheduler.step()
             last_epoch = epoch
@@ -1267,6 +1444,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--crop_size", nargs=2, type=int, default=None)
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--max_iters", type=int, default=None)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional reproducibility seed. Unset preserves the prior stochastic behavior.",
+    )
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument(
         "--grad_accum_steps",
@@ -1339,8 +1522,61 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="Weight for VFM loss in full-batch VFM+distill training. Distill weight is 1-eta.",
     )
-    parser.add_argument("--lambda_distill", type=float, default=1.0)
-    parser.add_argument("--lambda_td", type=float, default=1.0)
+    parser.add_argument(
+        "--lambda_distill",
+        type=float,
+        default=None,
+        help="Deprecated alias for --consistency_weight (default: 1.0).",
+    )
+    parser.add_argument(
+        "--lambda_td",
+        type=float,
+        default=None,
+        help="Deprecated scale applied to the default ECLD TD coefficient 2.0.",
+    )
+    parser.add_argument(
+        "--consistency_loss",
+        choices=["none", "psd", "csd", "ecld", "esd"],
+        default=None,
+        help=(
+            "Consistency objective (default: psd). If both this and the "
+            "deprecated --distill_loss are given, this option wins."
+        ),
+    )
+    parser.add_argument(
+        "--consistency_weight",
+        type=float,
+        default=None,
+        help=(
+            "Consistency multiplier inside the existing "
+            "eta*primary + (1-eta)*weight*consistency composition. "
+            "Defaults to deprecated --lambda_distill."
+        ),
+    )
+    parser.add_argument("--consistency_eps", type=float, default=1e-6)
+    parser.add_argument("--consistency_time_eps", type=float, default=1e-4)
+    parser.add_argument(
+        "--ecld_ec_weight",
+        type=float,
+        default=None,
+        help="Endpoint-consistency coefficient (default: 4.0).",
+    )
+    parser.add_argument(
+        "--ecld_td_weight",
+        type=float,
+        default=None,
+        help="Defaults to 2 * deprecated --lambda_td (normally 2.0).",
+    )
+    parser.add_argument(
+        "--ecld_time_weighting",
+        choices=["none", "inverse_square"],
+        default=None,
+        help=(
+            "Endpoint-CE time weighting. 'none' preserves the stable empirical "
+            "choice; inverse_square uses clamp(1-t,time_eps)^-2."
+        ),
+    )
+    parser.add_argument("--consistency_debug", action="store_true")
     parser.add_argument("--eps", type=float, default=0.05)
     parser.add_argument("--label_smoothing", type=float, default=0.0)
     parser.add_argument(
@@ -1351,7 +1587,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--distill_loss",
         choices=["ecld", "psd"],
-        default="psd",
+        default=None,
+        help="Deprecated alias for --consistency_loss.",
     )
     parser.add_argument("--prior_noise_std", type=float, default=1.0)
     parser.add_argument("--project_simplex", action="store_true")
