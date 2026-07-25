@@ -4,25 +4,41 @@ import json
 import math
 import os
 import random
+import time
 import warnings
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from typing import Dict, Iterable, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from CFM import CategoricalFlowMaps
 from consistency_losses import compute_consistency_loss, sample_consistency_times
 from dataset import Cityscapes20ClassDataset
+from distributed_utils import (
+    DistributedContext,
+    DistributedEvalSampler,
+    assert_equal_across_ranks,
+    cleanup_distributed,
+    distributed_barrier,
+    reduce_max,
+    reduce_scalar_dict,
+    seed_data_loader_worker,
+    setup_distributed,
+    unwrap_model,
+    wrap_ddp,
+)
 from model import SegDiffModel, SegFormerSourceGenerator
 from model_segformer import SegDiffSegFormerModel
 
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 HISTORY_KEYS = [
     "loss",
     "loss_base",
@@ -147,8 +163,8 @@ def get_amp_dtype(args: argparse.Namespace):
     raise ValueError(f"Unknown amp_dtype: {args.amp_dtype}")
 
 
-def autocast_context(args: argparse.Namespace):
-    if not args.amp or DEVICE != "cuda":
+def autocast_context(args: argparse.Namespace, device: torch.device):
+    if not args.amp or device.type != "cuda":
         return nullcontext()
     return torch.autocast(
         device_type="cuda",
@@ -156,8 +172,8 @@ def autocast_context(args: argparse.Namespace):
     )
 
 
-def build_grad_scaler(args: argparse.Namespace):
-    use_scaler = args.amp and args.amp_dtype == "fp16" and DEVICE == "cuda"
+def build_grad_scaler(args: argparse.Namespace, device: torch.device):
+    use_scaler = args.amp and args.amp_dtype == "fp16" and device.type == "cuda"
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
         return torch.amp.GradScaler("cuda", enabled=use_scaler)
     return torch.cuda.amp.GradScaler(enabled=use_scaler)
@@ -247,7 +263,119 @@ def apply_cfg_image_feature_dropout(
     return keep * image_feat + (1.0 - keep) * null_feat
 
 
-def json_safe_config(args: argparse.Namespace, optimizer_summary=None) -> Dict[str, object]:
+def compute_model_training_objectives(
+    model: torch.nn.Module,
+    *,
+    args: argparse.Namespace,
+    cfm: CategoricalFlowMaps,
+    image: torch.Tensor,
+    x0: torch.Tensor,
+    x1: torch.Tensor,
+    masks: torch.Tensor,
+) -> Dict[str, object]:
+    """Build the complete endpoint/image-encoder graph under one model forward."""
+    batch_size = image.size(0)
+    image_feat = model.encode_image(image)
+    image_feat = apply_cfg_image_feature_dropout(
+        model=model,
+        image_feat=image_feat,
+        drop_prob=args.cfg_drop_prob if args.use_cfg else 0.0,
+        training=model.training,
+        null_condition=args.cfg_null_condition,
+    )
+
+    t_vfm = torch.rand(batch_size, device=image.device)
+    x_t = cfm.path(x0, x1, t_vfm)
+    loss_inf, _, _ = cfm.vfm_loss(
+        model=model,
+        x_t=x_t,
+        img=image,
+        t=t_vfm,
+        mask=masks,
+        image_feat=image_feat,
+    )
+
+    s, u, t = sample_consistency_times(
+        args.consistency_loss,
+        batch_size,
+        device=image.device,
+    )
+    x_s = cfm.path(x0, x1, s)
+    loss_distill, distill_stats = compute_consistency_loss(
+        args.consistency_loss,
+        cfm=cfm,
+        model=model,
+        image=image,
+        x_s=x_s,
+        s=s,
+        u=u,
+        t=t,
+        image_feat=image_feat,
+        eps=args.consistency_eps,
+        time_eps=args.consistency_time_eps,
+        ecld_ec_weight=args.ecld_ec_weight,
+        ecld_td_weight=args.ecld_td_weight,
+        ecld_time_weighting=args.ecld_time_weighting,
+        amp_ecld=args.amp_ecld,
+        amp_dtype=(
+            get_amp_dtype(args)
+            if args.amp and args.amp_ecld
+            else None
+        ),
+        debug=args.consistency_debug,
+    )
+
+    loss_inf = loss_inf.float()
+    loss_distill = loss_distill.float()
+    loss_base = (
+        args.eta * loss_inf
+        + (1.0 - args.eta) * args.consistency_weight * loss_distill
+    )
+    return {
+        "loss_base": loss_base,
+        "loss_inf": loss_inf,
+        "loss_distill": loss_distill,
+        "distill_stats": distill_stats,
+    }
+
+
+class DDPCompatibleTrainingModel(torch.nn.Module):
+    """Route the complete training graph through one DDP forward invocation."""
+
+    _is_cfm_ddp_adapter = True
+
+    def __init__(self, wrapped_model: torch.nn.Module) -> None:
+        super().__init__()
+        self.wrapped_model = wrapped_model
+
+    def forward(self, *, operation: str, **kwargs):
+        if operation != "training_objectives":
+            raise ValueError(f"Unknown DDP model operation: {operation}")
+        return compute_model_training_objectives(
+            self.wrapped_model,
+            **kwargs,
+        )
+
+
+def run_model_training_objectives(
+    model: torch.nn.Module,
+    **kwargs,
+) -> Dict[str, object]:
+    if isinstance(model, DistributedDataParallel):
+        return model(operation="training_objectives", **kwargs)
+    return compute_model_training_objectives(model, **kwargs)
+
+
+def json_safe_config(
+    args: argparse.Namespace,
+    optimizer_summary=None,
+    distributed_context: Optional[DistributedContext] = None,
+) -> Dict[str, object]:
+    world_size = distributed_context.world_size if distributed_context is not None else 1
+    distributed = distributed_context.distributed if distributed_context is not None else False
+    backend = distributed_context.backend if distributed_context is not None else None
+    global_batch_size = int(args.batch_size * world_size)
+    effective_global_batch_size = int(global_batch_size * args.grad_accum_steps)
     config = vars(args).copy()
     config["image_size"] = list(args.image_size)
     if getattr(args, "crop_size", None) is not None:
@@ -266,7 +394,13 @@ def json_safe_config(args: argparse.Namespace, optimizer_summary=None) -> Dict[s
     config["use_ccdm_aug"] = bool(args.use_ccdm_aug)
     config["imagenet_normalize"] = bool(args.imagenet_normalize)
     config["grad_accum_steps"] = int(args.grad_accum_steps)
-    config["effective_batch_size"] = int(args.batch_size * args.grad_accum_steps)
+    config["effective_batch_size"] = effective_global_batch_size
+    config["distributed"] = distributed
+    config["world_size"] = world_size
+    config["local_batch_size"] = int(args.batch_size)
+    config["global_batch_size"] = global_batch_size
+    config["effective_global_batch_size"] = effective_global_batch_size
+    config["backend"] = backend
     config["hflip_prob"] = args.hflip_prob
     config["color_jitter_brightness"] = args.color_jitter_brightness
     config["color_jitter_contrast"] = args.color_jitter_contrast
@@ -496,7 +630,7 @@ def normalize_args(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
-def build_model(args: argparse.Namespace) -> SegDiffModel:
+def build_model(args: argparse.Namespace, device: torch.device) -> SegDiffModel:
     backbone = getattr(args, "backbone", "unet")
     if backbone == "unet":
         return SegDiffModel(
@@ -514,7 +648,7 @@ def build_model(args: argparse.Namespace) -> SegDiffModel:
             attn_levels=args.attn_levels,
             dropout=args.dropout,
             num_heads=args.num_heads,
-        ).to(DEVICE)
+        ).to(device)
 
     if backbone == "segformer":
         return SegDiffSegFormerModel(
@@ -527,12 +661,12 @@ def build_model(args: argparse.Namespace) -> SegDiffModel:
             endpoint_decoder_channels=args.endpoint_decoder_channels,
             endpoint_time_emb_dim=args.endpoint_time_emb_dim,
             endpoint_drop_path_rate=args.endpoint_drop_path_rate,
-        ).to(DEVICE)
+        ).to(device)
 
     raise ValueError(f"Unknown backbone: {backbone}")
 
 
-def build_source_net(args: argparse.Namespace):
+def build_source_net(args: argparse.Namespace, device: torch.device):
     if args.prior_type != "image_gaussian":
         return None
     fixed_std = None if args.source_learned_logvar else args.source_fixed_std
@@ -545,15 +679,15 @@ def build_source_net(args: argparse.Namespace):
         learned_logvar=args.source_learned_logvar,
         fixed_std=fixed_std,
         mu_tanh_scale=args.source_mu_tanh_scale,
-    ).to(DEVICE)
+    ).to(device)
 
 
-def build_cfm(args: argparse.Namespace) -> CategoricalFlowMaps:
+def build_cfm(args: argparse.Namespace, device: torch.device) -> CategoricalFlowMaps:
     return CategoricalFlowMaps(
         num_classes=args.num_classes,
         eps=args.eps,
         label_smoothing=args.label_smoothing,
-        device=DEVICE,
+        device=device,
         prior_type=args.prior_type,
         prior_noise_std=args.prior_noise_std,
         project_simplex=resolve_project_simplex(args),
@@ -799,9 +933,14 @@ def save_checkpoint(
     loss_best: float,
     history: Dict[str, list[float]],
     config: Dict[str, object],
+    global_step: int = 0,
+    optimizer_step: int = 0,
+    distributed_context: Optional[DistributedContext] = None,
 ) -> None:
+    if distributed_context is not None and not distributed_context.is_main_process:
+        raise RuntimeError("checkpoint saving is restricted to rank 0")
     payload = {
-        "model": model.state_dict(),
+        "model": unwrap_model(model).state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "epoch": epoch,
@@ -809,9 +948,11 @@ def save_checkpoint(
         "loss_best": loss_best,
         "losses": history,
         "config": config,
+        "global_step": global_step,
+        "optimizer_step": optimizer_step,
     }
     if source_net is not None:
-        payload["source_net"] = source_net.state_dict()
+        payload["source_net"] = unwrap_model(source_net).state_dict()
     if scaler is not None and scaler.is_enabled():
         payload["scaler"] = scaler.state_dict()
     torch.save(payload, path)
@@ -825,14 +966,18 @@ def evaluate_val_metrics(
     cfm: CategoricalFlowMaps,
     epoch_num: int,
     result_dir: Path,
+    distributed_context: DistributedContext,
     wandb_module=None,
 ) -> Dict[str, object]:
+    device = distributed_context.device
     was_training = model.training
     source_was_training = source_net.training if source_net is not None else None
+    eval_model = unwrap_model(model)
+    eval_source_net = unwrap_model(source_net) if source_net is not None else None
 
-    model.eval()
-    if source_net is not None:
-        source_net.eval()
+    eval_model.eval()
+    if eval_source_net is not None:
+        eval_source_net.eval()
 
     dataset = Cityscapes20ClassDataset(
         root=args.root,
@@ -843,25 +988,43 @@ def evaluate_val_metrics(
         color_jitter=False,
         imagenet_normalize=args.imagenet_normalize,
     )
+    sampler = None
+    if distributed_context.distributed:
+        sampler = DistributedEvalSampler(
+            dataset,
+            rank=distributed_context.rank,
+            world_size=distributed_context.world_size,
+        )
+    loader_generator = None
+    if args.seed is not None:
+        loader_generator = torch.Generator()
+        loader_generator.manual_seed(args.seed + distributed_context.rank)
     loader = DataLoader(
         dataset,
         batch_size=args.val_eval_batch_size or args.batch_size,
         shuffle=False,
+        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=True,
+        worker_init_fn=seed_data_loader_worker,
+        generator=loader_generator,
     )
 
     metrics = SegmentationMetrics(num_classes=args.num_classes)
 
-    for img, _, gt_mask in tqdm(loader, desc=f"val epoch {epoch_num}"):
-        img = img.to(DEVICE, non_blocking=True)
-        gt_mask = gt_mask.to(DEVICE, non_blocking=True)
+    for img, _, gt_mask in tqdm(
+        loader,
+        desc=f"val epoch {epoch_num}",
+        disable=not distributed_context.is_main_process,
+    ):
+        img = img.to(device, non_blocking=True)
+        gt_mask = gt_mask.to(device, non_blocking=True)
 
-        with autocast_context(args):
+        with autocast_context(args, device):
             pred = cfm.sample(
-                model=model,
+                model=eval_model,
                 img=img,
-                source_net=source_net,
+                source_net=eval_source_net,
                 num_steps=args.val_eval_num_steps,
                 return_intermediates=False,
                 use_cfg=args.use_cfg,
@@ -870,6 +1033,11 @@ def evaluate_val_metrics(
             )
 
         metrics.update(pred, gt_mask)
+
+    if distributed_context.distributed:
+        confusion = metrics.confmat.to(device=device)
+        dist.all_reduce(confusion, op=dist.ReduceOp.SUM)
+        metrics.confmat = confusion.cpu()
 
     result = metrics.compute()
     result.update(
@@ -894,61 +1062,68 @@ def evaluate_val_metrics(
         }
     )
 
-    save_dir = result_dir / "val_metrics" / f"epoch_{epoch_num:03d}"
-    save_dir.mkdir(parents=True, exist_ok=True)
+    if distributed_context.is_main_process:
+        save_dir = result_dir / "val_metrics" / f"epoch_{epoch_num:03d}"
+        save_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(save_dir / "metrics.json", "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+        with open(save_dir / "metrics.json", "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
 
-    with open(save_dir / "metrics.txt", "w", encoding="utf-8") as f:
-        f.write(f"epoch     : {result['epoch']}\n")
-        f.write(f"split     : {result['split']}\n")
-        f.write(f"num_steps : {result['num_steps']}\n")
-        f.write(f"backbone  : {result['backbone']}\n")
-        f.write(f"pixel_acc : {result['pixel_acc']:.6f}\n")
-        f.write(f"mIoU      : {result['mIoU']:.6f}\n")
-        f.write(f"mAcc      : {result['mAcc']:.6f}\n")
+        with open(save_dir / "metrics.txt", "w", encoding="utf-8") as f:
+            f.write(f"epoch     : {result['epoch']}\n")
+            f.write(f"split     : {result['split']}\n")
+            f.write(f"num_steps : {result['num_steps']}\n")
+            f.write(f"backbone  : {result['backbone']}\n")
+            f.write(f"pixel_acc : {result['pixel_acc']:.6f}\n")
+            f.write(f"mIoU      : {result['mIoU']:.6f}\n")
+            f.write(f"mAcc      : {result['mAcc']:.6f}\n")
 
-    print(
-        f"val epoch:{epoch_num} "
-        f"pixel_acc:{result['pixel_acc']:.6f} "
-        f"mIoU:{result['mIoU']:.6f} "
-        f"mAcc:{result['mAcc']:.6f} "
-        f"num_steps:{args.val_eval_num_steps}"
-    )
-
-    with open(result_dir / "val_metrics_log.txt", "a", encoding="utf-8") as f:
-        f.write(
-            f"epoch:{epoch_num} "
+        print(
+            f"val epoch:{epoch_num} "
             f"pixel_acc:{result['pixel_acc']:.6f} "
             f"mIoU:{result['mIoU']:.6f} "
             f"mAcc:{result['mAcc']:.6f} "
-            f"num_steps:{args.val_eval_num_steps}\n"
+            f"num_steps:{args.val_eval_num_steps}"
         )
 
-    if wandb_module is not None:
-        wandb_module.log(
-            {
-                "val/pixel_acc": result["pixel_acc"],
-                "val/mIoU": result["mIoU"],
-                "val/mAcc": result["mAcc"],
-                "val/num_steps": result["num_steps"],
-                "val/epoch": epoch_num,
-                "epoch": epoch_num,
-            }
-        )
+        with open(result_dir / "val_metrics_log.txt", "a", encoding="utf-8") as f:
+            f.write(
+                f"epoch:{epoch_num} "
+                f"pixel_acc:{result['pixel_acc']:.6f} "
+                f"mIoU:{result['mIoU']:.6f} "
+                f"mAcc:{result['mAcc']:.6f} "
+                f"num_steps:{args.val_eval_num_steps}\n"
+            )
+
+        if wandb_module is not None:
+            wandb_module.log(
+                {
+                    "val/pixel_acc": result["pixel_acc"],
+                    "val/mIoU": result["mIoU"],
+                    "val/mAcc": result["mAcc"],
+                    "val/num_steps": result["num_steps"],
+                    "val/epoch": epoch_num,
+                    "epoch": epoch_num,
+                }
+            )
 
     if was_training:
-        model.train()
-    if source_net is not None and source_was_training:
-        source_net.train()
+        eval_model.train()
+    if eval_source_net is not None and source_was_training:
+        eval_source_net.train()
 
     return result
 
 
-def train(args: argparse.Namespace) -> None:
+def train(
+    args: argparse.Namespace,
+    distributed_context: DistributedContext,
+) -> None:
+    device = distributed_context.device
     result_dir = Path(args.result_dir)
-    result_dir.mkdir(parents=True, exist_ok=True)
+    if distributed_context.is_main_process:
+        result_dir.mkdir(parents=True, exist_ok=True)
+    distributed_barrier(distributed_context)
     log_path = result_dir / "train_log.txt"
 
     ckpt = None
@@ -956,47 +1131,93 @@ def train(args: argparse.Namespace) -> None:
         ckpt_path = result_dir / "segdiff_final.pth"
         if not ckpt_path.exists():
             raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location=DEVICE)
+        ckpt = torch.load(ckpt_path, map_location=device)
         args = merge_resume_config(args, ckpt, result_dir)
 
     args = normalize_args(args)
-    seed_everything(args.seed)
-    model = build_model(args)
-    source_net = build_source_net(args)
-    cfm = build_cfm(args)
-    optimizer = build_optimizer(args, model, source_net)
-    scaler = build_grad_scaler(args)
-    config = json_safe_config(args, optimizer_summary(optimizer))
-    save_json(result_dir / "config.json", config)
+    rank_seed = args.seed + distributed_context.rank if args.seed is not None else None
+    seed_everything(rank_seed)
+    raw_model = build_model(args, device)
+    raw_source_net = build_source_net(args, device)
+    cfm = build_cfm(args, device)
 
     if ckpt is not None:
-        model_missing_null_image_feat = load_model_state_dict_compat(model, ckpt["model"])
-        if source_net is not None and "source_net" in ckpt:
-            source_net.load_state_dict(ckpt["source_net"])
-        elif source_net is not None:
+        model_missing_null_image_feat = load_model_state_dict_compat(
+            raw_model,
+            ckpt["model"],
+        )
+        if raw_source_net is not None and "source_net" in ckpt:
+            raw_source_net.load_state_dict(ckpt["source_net"])
+        elif raw_source_net is not None:
             warnings.warn("source_net is configured but checkpoint has no source_net state.", RuntimeWarning)
+    else:
+        model_missing_null_image_feat = False
+
+    if distributed_context.distributed:
+        model_find_unused = not (
+            args.use_cfg
+            and args.cfg_null_condition == "learned"
+            and args.cfg_drop_prob > 0.0
+        )
+        model = wrap_ddp(
+            DDPCompatibleTrainingModel(raw_model),
+            distributed_context,
+            find_unused_parameters=model_find_unused,
+        )
+        source_net = (
+            wrap_ddp(
+                raw_source_net,
+                distributed_context,
+                find_unused_parameters=False,
+            )
+            if raw_source_net is not None
+            else None
+        )
+    else:
+        model = raw_model
+        source_net = raw_source_net
+
+    optimizer = build_optimizer(args, model, source_net)
+    scaler = build_grad_scaler(args, device)
+    scheduler = build_scheduler(args, optimizer, resume=args.resume)
+
+    if ckpt is not None:
         load_optimizer_state_dict_compat(
             optimizer,
             ckpt["optimizer"],
             model_missing_null_image_feat=model_missing_null_image_feat,
         )
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
         if scaler.is_enabled() and "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])
         start_epoch = int(ckpt["epoch"]) + 1
         end_epoch = start_epoch + args.extra_epochs
         history = init_history(ckpt.get("losses", []))
         loss_best = float(ckpt.get("loss_best", float("inf")))
-        print(f"Resume training from: {result_dir / 'segdiff_final.pth'}")
-        print(f"start_epoch: {start_epoch + 1}")
-        print(f"end_epoch  : {end_epoch}")
+        if distributed_context.is_main_process:
+            print(f"Resume training from: {result_dir / 'segdiff_final.pth'}")
+            print(f"start_epoch: {start_epoch + 1}")
+            print(f"end_epoch  : {end_epoch}")
     else:
         start_epoch = 0
         end_epoch = args.epochs
         history = init_history()
         loss_best = float("inf")
 
-    scheduler = build_scheduler(args, optimizer, resume=args.resume)
-    wandb = init_wandb(args, config)
+    config = json_safe_config(
+        args,
+        optimizer_summary(optimizer),
+        distributed_context=distributed_context,
+    )
+    if distributed_context.is_main_process:
+        save_json(result_dir / "config.json", config)
+    distributed_barrier(distributed_context)
+    wandb = (
+        init_wandb(args, config)
+        if distributed_context.is_main_process
+        else None
+    )
 
     dataset = Cityscapes20ClassDataset(
         root=args.root,
@@ -1013,43 +1234,85 @@ def train(args: argparse.Namespace) -> None:
         color_jitter_hue=args.color_jitter_hue,
         imagenet_normalize=args.imagenet_normalize,
     )
+    train_sampler = None
+    if distributed_context.distributed:
+        train_sampler = DistributedSampler(
+            dataset,
+            num_replicas=distributed_context.world_size,
+            rank=distributed_context.rank,
+            shuffle=True,
+            seed=args.seed if args.seed is not None else 0,
+            drop_last=True,
+        )
     loader_generator = None
     if args.seed is not None:
         loader_generator = torch.Generator()
-        loader_generator.manual_seed(args.seed)
+        loader_generator.manual_seed(rank_seed)
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        worker_init_fn=seed_data_loader_worker,
         generator=loader_generator,
     )
+    assert_equal_across_ranks(
+        len(loader),
+        distributed_context,
+        name="train DataLoader batch count",
+    )
 
-    global_step = 0
-    optimizer_step = 0
+    global_step = int(ckpt.get("global_step", 0)) if ckpt is not None else 0
+    optimizer_step = int(ckpt.get("optimizer_step", 0)) if ckpt is not None else 0
+    run_iteration = 0
     last_epoch = start_epoch - 1
     stop_training = False
     vis_epochs = {10, 30, 50, 70, 90, 110, 130}
-    if DEVICE == "cuda":
+    if distributed_context.is_main_process:
+        print(f"Distributed training: {distributed_context.distributed}")
+        print(f"Backend: {distributed_context.backend or 'none'}")
+        print(f"World size: {distributed_context.world_size}")
+        print(f"Local batch size: {args.batch_size}")
+        print(f"Global batch size: {args.batch_size * distributed_context.world_size}")
+        print(f"Gradient accumulation steps: {args.grad_accum_steps}")
+        print(
+            "Effective global batch size: "
+            f"{args.batch_size * distributed_context.world_size * args.grad_accum_steps}"
+        )
+    if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
     try:
         for epoch in range(start_epoch, end_epoch):
             model.train()
             if source_net is not None:
                 source_net.train()
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
 
-            sums = {key: 0.0 for key in HISTORY_KEYS + PRIOR_LOG_KEYS + ["x1_abs"]}
+            sums = {
+                key: 0.0
+                for key in HISTORY_KEYS
+                + PRIOR_LOG_KEYS
+                + ["x1_abs", "grad_norm", "grad_norm_count"]
+            }
             cnt = 0
+            epoch_start_time = time.perf_counter()
 
             optimizer.zero_grad(set_to_none=True)
             num_batches = len(loader)
 
-            for batch_idx, (img, x_1, masks) in enumerate(tqdm(loader, desc=f"epoch {epoch + 1}")):
-                img = img.to(DEVICE, non_blocking=True)
-                x_1 = x_1.to(DEVICE, non_blocking=True)
-                masks = masks.to(DEVICE, non_blocking=True).long()
+            progress = tqdm(
+                loader,
+                desc=f"epoch {epoch + 1}",
+                disable=not distributed_context.is_main_process,
+            )
+            for batch_idx, (img, x_1, masks) in enumerate(progress):
+                img = img.to(device, non_blocking=True)
+                x_1 = x_1.to(device, non_blocking=True)
+                masks = masks.to(device, non_blocking=True).long()
 
                 B = img.size(0)
                 if B == 0:
@@ -1058,151 +1321,132 @@ def train(args: argparse.Namespace) -> None:
                 group_start = (batch_idx // args.grad_accum_steps) * args.grad_accum_steps
                 normal_group_end = min(group_start + args.grad_accum_steps, num_batches)
                 if args.max_iters is not None:
-                    global_step_at_group_start = global_step - (batch_idx - group_start)
-                    max_group_end = group_start + max(args.max_iters - global_step_at_group_start, 0)
+                    iteration_at_group_start = run_iteration - (batch_idx - group_start)
+                    max_group_end = group_start + max(
+                        args.max_iters - iteration_at_group_start,
+                        0,
+                    )
                     group_end = min(normal_group_end, max_group_end)
                 else:
                     group_end = normal_group_end
                 accum_steps_this_update = max(group_end - group_start, 1)
                 should_step = (batch_idx + 1) == group_end
                 will_stop_after_this_batch = (
-                    args.max_iters is not None and (global_step + 1) >= args.max_iters
+                    args.max_iters is not None and (run_iteration + 1) >= args.max_iters
                 )
 
-                with autocast_context(args):
-                    B, _, H, W = x_1.shape
+                grad_norm = None
+                with ExitStack() as sync_stack:
+                    if distributed_context.distributed and not should_step:
+                        sync_stack.enter_context(model.no_sync())
+                        if source_net is not None:
+                            sync_stack.enter_context(source_net.no_sync())
 
-                    x0, prior_stats = cfm.sample_prior(
-                        B=B,
-                        H=H,
-                        W=W,
-                        device=DEVICE,
-                        dtype=x_1.dtype,
-                        img=img,
-                        source_net=source_net,
-                        target_x1=x_1,
-                        return_stats=True,
-                    )
-                    
-                    image_feat = model.encode_image(img)
-                    image_feat = apply_cfg_image_feature_dropout(
-                        model=model,
-                        image_feat=image_feat,
-                        drop_prob=args.cfg_drop_prob if args.use_cfg else 0.0,
-                        training=model.training,
-                        null_condition=args.cfg_null_condition,
-                    )
+                    with autocast_context(args, device):
+                        B, _, H, W = x_1.shape
+                        x0, prior_stats = cfm.sample_prior(
+                            B=B,
+                            H=H,
+                            W=W,
+                            device=device,
+                            dtype=x_1.dtype,
+                            img=img,
+                            source_net=source_net,
+                            target_x1=x_1,
+                            return_stats=True,
+                        )
+                        objectives = run_model_training_objectives(
+                            model,
+                            args=args,
+                            cfm=cfm,
+                            image=img,
+                            x0=x0,
+                            x1=x_1,
+                            masks=masks,
+                        )
+                        loss_base = objectives["loss_base"]
+                        loss_inf = objectives["loss_inf"]
+                        loss_distill = objectives["loss_distill"]
+                        distill_stats = objectives["distill_stats"]
+                        loss_var = prior_stats["loss_var"].float()
+                        loss_align = prior_stats["loss_align"].float()
+                        weighted_var = prior_stats["weighted_var"].float()
+                        weighted_align = prior_stats["weighted_align"].float()
+                        loss = (
+                            loss_base + weighted_var + weighted_align
+                        ).float()
 
-                    t_vfm = torch.rand(B, device=DEVICE)
-                    x_t = cfm.path(x0, x_1, t_vfm)
+                    loss_for_backward = loss / accum_steps_this_update
+                    if scaler is not None and scaler.is_enabled():
+                        scaler.scale(loss_for_backward).backward()
+                        if should_step:
+                            if args.grad_clip is not None and args.grad_clip > 0:
+                                scaler.unscale_(optimizer)
+                                grad_norm = torch.nn.utils.clip_grad_norm_(
+                                    trainable_params(model, source_net),
+                                    max_norm=args.grad_clip,
+                                )
+                            scaler.step(optimizer)
+                            scaler.update()
+                            optimizer.zero_grad(set_to_none=True)
+                            optimizer_step += 1
+                    else:
+                        loss_for_backward.backward()
+                        if should_step:
+                            if args.grad_clip is not None and args.grad_clip > 0:
+                                grad_norm = torch.nn.utils.clip_grad_norm_(
+                                    trainable_params(model, source_net),
+                                    max_norm=args.grad_clip,
+                                )
+                            optimizer.step()
+                            optimizer.zero_grad(set_to_none=True)
+                            optimizer_step += 1
 
-                    loss_inf, _, _ = cfm.vfm_loss(
-                        model=model,
-                        x_t=x_t,
-                        img=img,
-                        t=t_vfm,
-                        mask=masks,
-                        image_feat=image_feat
-                    )
-
-                    s, u, t = sample_consistency_times(
-                        args.consistency_loss,
-                        B,
-                        device=DEVICE,
-                    )
-                    x_s = cfm.path(x0, x_1, s)
-                    loss_distill, distill_stats = compute_consistency_loss(
-                        args.consistency_loss,
-                        cfm=cfm,
-                        model=model,
-                        image=img,
-                        x_s=x_s,
-                        s=s,
-                        u=u,
-                        t=t,
-                        image_feat=image_feat,
-                        eps=args.consistency_eps,
-                        time_eps=args.consistency_time_eps,
-                        ecld_ec_weight=args.ecld_ec_weight,
-                        ecld_td_weight=args.ecld_td_weight,
-                        ecld_time_weighting=args.ecld_time_weighting,
-                        amp_ecld=args.amp_ecld,
-                        amp_dtype=(
-                            get_amp_dtype(args)
-                            if args.amp and args.amp_ecld
-                            else None
-                        ),
-                        debug=args.consistency_debug,
-                    )
-
-                    loss_inf = loss_inf.float()
-                    loss_distill = loss_distill.float()
-
-                    loss_base = (
-                        args.eta * loss_inf
-                        + (1.0 - args.eta) * args.consistency_weight * loss_distill
-                    )
-
-                    loss_var = prior_stats["loss_var"].float()
-                    loss_align = prior_stats["loss_align"].float()
-                    weighted_var = prior_stats["weighted_var"].float()
-                    weighted_align = prior_stats["weighted_align"].float()
-
-                    loss = (loss_base + weighted_var + weighted_align).float()
-
-                loss_for_backward = loss / accum_steps_this_update
-
-                if scaler is not None and scaler.is_enabled():
-                    scaler.scale(loss_for_backward).backward()
-                    if should_step:
-                        if args.grad_clip is not None and args.grad_clip > 0:
-                            scaler.unscale_(optimizer)
-                            torch.nn.utils.clip_grad_norm_(
-                                trainable_params(model, source_net),
-                                max_norm=args.grad_clip,
-                            )
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad(set_to_none=True)
-                        optimizer_step += 1
-                else:
-                    loss_for_backward.backward()
-                    if should_step:
-                        if args.grad_clip is not None and args.grad_clip > 0:
-                            torch.nn.utils.clip_grad_norm_(
-                                trainable_params(model, source_net),
-                                max_norm=args.grad_clip,
-                            )
-                        optimizer.step()
-                        optimizer.zero_grad(set_to_none=True)
-                        optimizer_step += 1
-
-                batch_metrics = {
-                    "loss": tensor_item(loss),
-                    "loss_base": tensor_item(loss_base),
-                    "inf": tensor_item(loss_inf),
-                    "distill": tensor_item(loss_distill),
-                    "ce_ec": tensor_item(distill_stats["loss_ce_ec"]),
-                    "td": tensor_item(distill_stats["loss_td"]),
-                    "loss_var": tensor_item(loss_var),
-                    "loss_align": tensor_item(loss_align),
-                    "weighted_var": tensor_item(weighted_var),
-                    "weighted_align": tensor_item(weighted_align),
+                local_metrics = {
+                    "loss": loss,
+                    "loss_base": loss_base,
+                    "inf": loss_inf,
+                    "distill": loss_distill,
+                    "ce_ec": distill_stats["loss_ce_ec"],
+                    "td": distill_stats["loss_td"],
+                    "loss_var": loss_var,
+                    "loss_align": loss_align,
+                    "weighted_var": weighted_var,
+                    "weighted_align": weighted_align,
+                    "grad_norm": (
+                        grad_norm.detach()
+                        if grad_norm is not None
+                        else torch.zeros_like(loss.detach())
+                    ),
+                    "grad_norm_count": torch.tensor(
+                        float(grad_norm is not None),
+                        device=loss.device,
+                    ),
                 }
                 zero_consistency_stat = torch.zeros_like(loss_distill.detach())
                 for key in HISTORY_KEYS:
-                    if key not in batch_metrics:
-                        batch_metrics[key] = tensor_item(
-                            distill_stats.get(key, zero_consistency_stat)
+                    if key not in local_metrics:
+                        local_metrics[key] = distill_stats.get(
+                            key,
+                            zero_consistency_stat,
                         )
 
                 for key in PRIOR_LOG_KEYS:
-                    batch_metrics[key] = tensor_item(prior_stats[key])
-                batch_metrics["x1_abs"] = tensor_item(x_1.abs().mean())
-
-                for key, value in batch_metrics.items():
-                    sums[key] += value
-                cnt += 1
+                    local_metrics[key] = prior_stats[key]
+                local_metrics["x1_abs"] = x_1.abs().mean()
+                reduced_metrics = reduce_scalar_dict(
+                    local_metrics,
+                    distributed_context,
+                )
+                batch_metrics = None
+                if distributed_context.is_main_process:
+                    batch_metrics = {
+                        key: tensor_item(value)
+                        for key, value in reduced_metrics.items()
+                    }
+                    for key, value in batch_metrics.items():
+                        sums[key] += value
+                    cnt += 1
 
                 if wandb is not None and args.wandb_log_interval > 0 and global_step % args.wandb_log_interval == 0:
                     batch_payload = {
@@ -1221,11 +1465,21 @@ def train(args: argparse.Namespace) -> None:
                             "batch/consistency_weight": args.consistency_weight,
                             "batch/consistency_loss_type": args.consistency_loss,
                             "batch/grad_accum_steps": args.grad_accum_steps,
-                            "batch/effective_batch_size": args.batch_size * args.grad_accum_steps,
+                            "batch/local_batch_size": args.batch_size,
+                            "batch/global_batch_size": (
+                                args.batch_size * distributed_context.world_size
+                            ),
+                            "batch/effective_batch_size": (
+                                args.batch_size
+                                * distributed_context.world_size
+                                * args.grad_accum_steps
+                            ),
                             "batch/accum_steps_this_update": accum_steps_this_update,
                             "global_step": global_step,
                             "optimizer_step": optimizer_step,
                     }
+                    if batch_metrics["grad_norm_count"] > 0.0:
+                        batch_payload["batch/grad_norm"] = batch_metrics["grad_norm"]
                     batch_payload.update(
                         consistency_component_payload(
                             "batch",
@@ -1235,61 +1489,100 @@ def train(args: argparse.Namespace) -> None:
                     )
                     wandb.log(batch_payload)
                 global_step += 1
+                run_iteration += 1
                 if will_stop_after_this_batch:
                     stop_training = True
                     break
 
-            if cnt == 0:
+            if distributed_context.is_main_process and cnt == 0:
                 raise RuntimeError("No training batches were processed.")
 
-            avg = {key: value / cnt for key, value in sums.items()}
-            for key in HISTORY_KEYS:
-                history[key].append(avg[key])
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+                local_peak_allocated_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+                local_peak_reserved_mb = torch.cuda.max_memory_reserved(device) / (1024 ** 2)
+            else:
+                local_peak_allocated_mb = 0.0
+                local_peak_reserved_mb = 0.0
+            elapsed_seconds = time.perf_counter() - epoch_start_time
+            max_peak_allocated_mb = tensor_item(
+                reduce_max(
+                    torch.tensor(local_peak_allocated_mb, device=device),
+                    distributed_context,
+                )
+            )
+            max_peak_reserved_mb = tensor_item(
+                reduce_max(
+                    torch.tensor(local_peak_reserved_mb, device=device),
+                    distributed_context,
+                )
+            )
+            max_elapsed_seconds = tensor_item(
+                reduce_max(
+                    torch.tensor(elapsed_seconds, device=device),
+                    distributed_context,
+                )
+            )
 
+            avg = None
             current_lr = optimizer.param_groups[0]["lr"]
-            peak_gpu_memory_mb = (
-                torch.cuda.max_memory_allocated() / (1024 ** 2)
-                if DEVICE == "cuda"
-                else 0.0
-            )
-            log_line = (
-                f"epoch:{epoch + 1} "
-                f"loss_avg:{avg['loss']:.6f} "
-                f"loss_base:{avg['loss_base']:.6f} "
-                f"inf:{avg['inf']:.6f} "
-                f"distill:{avg['distill']:.6f} "
-                f"loss_total:{avg['loss']:.6f} "
-                f"loss_primary:{avg['inf']:.6f} "
-                f"loss_consistency:{avg['distill']:.6f} "
-                f"distill_type:{args.consistency_loss} "
-                f"consistency_loss_type:{args.consistency_loss} "
-                f"consistency_weight:{args.consistency_weight:.6f} "
-                f"ce_ec:{avg['ce_ec']:.6f} "
-                f"td:{avg['td']:.6f} "
-                f"loss_var:{avg['loss_var']:.6f} "
-                f"loss_align:{avg['loss_align']:.6f} "
-                f"weighted_var:{avg['weighted_var']:.6f} "
-                f"weighted_align:{avg['weighted_align']:.6f} "
-                f"mu_abs:{avg['mu_abs']:.6f} "
-                f"mu_min:{avg['mu_min']:.6f} "
-                f"mu_max:{avg['mu_max']:.6f} "
-                f"logvar_mean:{avg['logvar_mean']:.6f} "
-                f"sigma_mean:{avg['sigma_mean']:.6f} "
-                f"x0_abs:{avg['x0_abs']:.6f} "
-                f"x1_abs:{avg['x1_abs']:.6f} "
-                f"grad_accum_steps:{args.grad_accum_steps} "
-                f"effective_batch_size:{args.batch_size * args.grad_accum_steps} "
-                f"optimizer_step:{optimizer_step} "
-                f"peak_gpu_memory_mb:{peak_gpu_memory_mb:.1f} "
-                f"lr:{current_lr:.8e}"
-            )
-            for key in CONSISTENCY_COMPONENT_KEYS[args.consistency_loss]:
-                log_line += f" {key}:{avg[key]:.6f}"
-            print(log_line)
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(log_line + "\n")
+            if distributed_context.is_main_process:
+                avg = {key: value / cnt for key, value in sums.items()}
+                avg_grad_norm = sums["grad_norm"] / max(sums["grad_norm_count"], 1.0)
+                for key in HISTORY_KEYS:
+                    history[key].append(avg[key])
+                global_images = cnt * args.batch_size * distributed_context.world_size
+                images_per_second = global_images / max(max_elapsed_seconds, 1e-12)
+                optimizer_updates_per_second = (
+                    math.ceil(cnt / args.grad_accum_steps)
+                    / max(max_elapsed_seconds, 1e-12)
+                )
+                log_line = (
+                    f"epoch:{epoch + 1} "
+                    f"loss_avg:{avg['loss']:.6f} "
+                    f"loss_base:{avg['loss_base']:.6f} "
+                    f"inf:{avg['inf']:.6f} "
+                    f"distill:{avg['distill']:.6f} "
+                    f"loss_total:{avg['loss']:.6f} "
+                    f"loss_primary:{avg['inf']:.6f} "
+                    f"loss_consistency:{avg['distill']:.6f} "
+                    f"distill_type:{args.consistency_loss} "
+                    f"consistency_loss_type:{args.consistency_loss} "
+                    f"consistency_weight:{args.consistency_weight:.6f} "
+                    f"ce_ec:{avg['ce_ec']:.6f} "
+                    f"td:{avg['td']:.6f} "
+                    f"loss_var:{avg['loss_var']:.6f} "
+                    f"loss_align:{avg['loss_align']:.6f} "
+                    f"weighted_var:{avg['weighted_var']:.6f} "
+                    f"weighted_align:{avg['weighted_align']:.6f} "
+                    f"mu_abs:{avg['mu_abs']:.6f} "
+                    f"mu_min:{avg['mu_min']:.6f} "
+                    f"mu_max:{avg['mu_max']:.6f} "
+                    f"logvar_mean:{avg['logvar_mean']:.6f} "
+                    f"sigma_mean:{avg['sigma_mean']:.6f} "
+                    f"x0_abs:{avg['x0_abs']:.6f} "
+                    f"x1_abs:{avg['x1_abs']:.6f} "
+                    f"local_batch_size:{args.batch_size} "
+                    f"global_batch_size:{args.batch_size * distributed_context.world_size} "
+                    f"grad_accum_steps:{args.grad_accum_steps} "
+                    f"effective_batch_size:{args.batch_size * distributed_context.world_size * args.grad_accum_steps} "
+                    f"optimizer_step:{optimizer_step} "
+                    f"grad_norm:{avg_grad_norm:.6f} "
+                    f"rank0_peak_allocated_mb:{local_peak_allocated_mb:.1f} "
+                    f"max_peak_allocated_mb:{max_peak_allocated_mb:.1f} "
+                    f"rank0_peak_reserved_mb:{local_peak_reserved_mb:.1f} "
+                    f"max_peak_reserved_mb:{max_peak_reserved_mb:.1f} "
+                    f"images_per_second:{images_per_second:.3f} "
+                    f"optimizer_updates_per_second:{optimizer_updates_per_second:.3f} "
+                    f"lr:{current_lr:.8e}"
+                )
+                for key in CONSISTENCY_COMPONENT_KEYS[args.consistency_loss]:
+                    log_line += f" {key}:{avg[key]:.6f}"
+                print(log_line)
+                with open(log_path, "a", encoding="utf-8") as f:
+                    f.write(log_line + "\n")
 
-            if wandb is not None:
+            if wandb is not None and avg is not None:
                 train_payload = {
                         "train/loss": avg["loss"],
                         "train/loss_base": avg["loss_base"],
@@ -1316,8 +1609,17 @@ def train(args: argparse.Namespace) -> None:
                         "train/x0_abs": avg["x0_abs"],
                         "train/x1_abs": avg["x1_abs"],
                         "train/grad_accum_steps": args.grad_accum_steps,
-                        "train/effective_batch_size": args.batch_size * args.grad_accum_steps,
-                        "train/peak_gpu_memory_mb": peak_gpu_memory_mb,
+                        "train/local_batch_size": args.batch_size,
+                        "train/global_batch_size": args.batch_size * distributed_context.world_size,
+                        "train/effective_batch_size": args.batch_size * distributed_context.world_size * args.grad_accum_steps,
+                        "train/grad_norm": avg_grad_norm,
+                        "train/peak_gpu_memory_mb": max_peak_allocated_mb,
+                        "train/rank0_peak_allocated_mb": local_peak_allocated_mb,
+                        "train/max_peak_allocated_mb": max_peak_allocated_mb,
+                        "train/rank0_peak_reserved_mb": local_peak_reserved_mb,
+                        "train/max_peak_reserved_mb": max_peak_reserved_mb,
+                        "train/images_per_second": images_per_second,
+                        "train/optimizer_updates_per_second": optimizer_updates_per_second,
                         "epoch": epoch + 1,
                         "optimizer_step": optimizer_step,
                 }
@@ -1333,7 +1635,11 @@ def train(args: argparse.Namespace) -> None:
             scheduler.step()
             last_epoch = epoch
 
-            if avg["loss"] < loss_best:
+            if (
+                distributed_context.is_main_process
+                and avg is not None
+                and avg["loss"] < loss_best
+            ):
                 loss_best = avg["loss"]
                 save_checkpoint(
                     result_dir / "segdiff_best.pth",
@@ -1347,26 +1653,35 @@ def train(args: argparse.Namespace) -> None:
                     loss_best,
                     history,
                     config,
+                    global_step=global_step,
+                    optimizer_step=optimizer_step,
+                    distributed_context=distributed_context,
                 )
 
-            if (epoch + 1) % 10 == 0 or (epoch + 1) == end_epoch:
+            if distributed_context.is_main_process and (
+                (epoch + 1) % 10 == 0 or (epoch + 1) == end_epoch
+            ):
                 plot_loss_curves(history, result_dir / "loss_curves", epoch)
                 
             epoch_num = epoch + 1
             if epoch_num in args.val_eval_epochs:
-                save_checkpoint(
-                    result_dir / f"segdiff_epoch_{epoch_num:03d}.pth",
-                    model,
-                    source_net,
-                    optimizer,
-                    scheduler,
-                    scaler,
-                    epoch,
-                    args,
-                    loss_best,
-                    history,
-                    config,
-                )
+                if distributed_context.is_main_process:
+                    save_checkpoint(
+                        result_dir / f"segdiff_epoch_{epoch_num:03d}.pth",
+                        model,
+                        source_net,
+                        optimizer,
+                        scheduler,
+                        scaler,
+                        epoch,
+                        args,
+                        loss_best,
+                        history,
+                        config,
+                        global_step=global_step,
+                        optimizer_step=optimizer_step,
+                        distributed_context=distributed_context,
+                    )
                 evaluate_val_metrics(
                     args=args,
                     model=model,
@@ -1374,67 +1689,85 @@ def train(args: argparse.Namespace) -> None:
                     cfm=cfm,
                     epoch_num=epoch_num,
                     result_dir=result_dir,
+                    distributed_context=distributed_context,
                     wandb_module=wandb,
                 )
 
             if epoch_num in vis_epochs:
-                cfm.run_inference_examples(
-                    model=model,
-                    source_net=source_net,
-                    root=args.root,
-                    split="val",
-                    batch_size=args.batch_size,
-                    num_steps=1,
-                    save_dir=str(result_dir / "infer_val" / f"epoch_{epoch_num:03d}"),
-                    image_size=args.image_size,
-                    num_workers=args.num_workers,
-                    use_wandb=wandb is not None and args.wandb_log_images,
-                    wandb_module=wandb,
-                    wandb_prefix=f"eval_inference/epoch_{epoch_num:03d}",
-                    max_images=args.wandb_num_images if args.wandb_log_images else args.batch_size,
-                    use_cfg=args.use_cfg,
-                    cfg_scale=args.cfg_scale,
-                    cfg_null_condition=args.cfg_null_condition,
-                    imagenet_normalize=args.imagenet_normalize,
-                )
+                distributed_barrier(distributed_context)
+                if distributed_context.is_main_process:
+                    cfm.run_inference_examples(
+                        model=unwrap_model(model),
+                        source_net=(
+                            unwrap_model(source_net)
+                            if source_net is not None
+                            else None
+                        ),
+                        root=args.root,
+                        split="val",
+                        batch_size=args.batch_size,
+                        num_steps=1,
+                        save_dir=str(result_dir / "infer_val" / f"epoch_{epoch_num:03d}"),
+                        image_size=args.image_size,
+                        num_workers=args.num_workers,
+                        use_wandb=wandb is not None and args.wandb_log_images,
+                        wandb_module=wandb,
+                        wandb_prefix=f"eval_inference/epoch_{epoch_num:03d}",
+                        max_images=args.wandb_num_images if args.wandb_log_images else args.batch_size,
+                        use_cfg=args.use_cfg,
+                        cfg_scale=args.cfg_scale,
+                        cfg_null_condition=args.cfg_null_condition,
+                        imagenet_normalize=args.imagenet_normalize,
+                    )
+                distributed_barrier(distributed_context)
 
             if stop_training:
                 break
                 
 
-        save_checkpoint(
-            result_dir / "segdiff_final.pth",
-            model,
-            source_net,
-            optimizer,
-            scheduler,
-            scaler,
-            last_epoch,
-            args,
-            loss_best,
-            history,
-            config,
-        )
-
-        cfm.run_inference_examples(
-            model=model,
-            source_net=source_net,
-            root=args.root,
-            split="val",
-            batch_size=args.batch_size,
-            num_steps=1,
-            save_dir=str(result_dir / "infer_val"),
-            image_size=args.image_size,
-            num_workers=args.num_workers,
-            use_wandb=args.use_wandb and args.wandb_log_images,
-            wandb_module=wandb,
-            wandb_prefix="train_inference",
-            max_images=args.wandb_num_images if args.wandb_log_images else args.batch_size,
-            use_cfg=args.use_cfg,
-            cfg_scale=args.cfg_scale,
-            cfg_null_condition=args.cfg_null_condition,
-            imagenet_normalize=args.imagenet_normalize,
-        )
+        if distributed_context.is_main_process:
+            save_checkpoint(
+                result_dir / "segdiff_final.pth",
+                model,
+                source_net,
+                optimizer,
+                scheduler,
+                scaler,
+                last_epoch,
+                args,
+                loss_best,
+                history,
+                config,
+                global_step=global_step,
+                optimizer_step=optimizer_step,
+                distributed_context=distributed_context,
+            )
+        distributed_barrier(distributed_context)
+        if distributed_context.is_main_process:
+            cfm.run_inference_examples(
+                model=unwrap_model(model),
+                source_net=(
+                    unwrap_model(source_net)
+                    if source_net is not None
+                    else None
+                ),
+                root=args.root,
+                split="val",
+                batch_size=args.batch_size,
+                num_steps=1,
+                save_dir=str(result_dir / "infer_val"),
+                image_size=args.image_size,
+                num_workers=args.num_workers,
+                use_wandb=args.use_wandb and args.wandb_log_images,
+                wandb_module=wandb,
+                wandb_prefix="train_inference",
+                max_images=args.wandb_num_images if args.wandb_log_images else args.batch_size,
+                use_cfg=args.use_cfg,
+                cfg_scale=args.cfg_scale,
+                cfg_null_condition=args.cfg_null_condition,
+                imagenet_normalize=args.imagenet_normalize,
+            )
+        distributed_barrier(distributed_context)
     finally:
         if wandb is not None:
             wandb.finish()
@@ -1658,4 +1991,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 if __name__ == "__main__":
-    train(build_parser().parse_args())
+    context = setup_distributed()
+    try:
+        train(
+            build_parser().parse_args(),
+            distributed_context=context,
+        )
+    finally:
+        cleanup_distributed(context)

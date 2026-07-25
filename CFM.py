@@ -117,7 +117,8 @@ class CategoricalFlowMaps:
             )
 
         zero = torch.zeros((), device=device, dtype=dtype)
-        fixed_std = getattr(source_net, "fixed_std", None)
+        source_module = getattr(source_net, "module", source_net)
+        fixed_std = getattr(source_module, "fixed_std", None)
         if fixed_std is not None:
             std = float(fixed_std)
             eps = torch.randn_like(mu)
