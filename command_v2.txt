@@ -1,0 +1,200 @@
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=3 \
+uv run python /home/igarashi_25/playground_2/CSDFM/CFM/src/segv3_aug/main.py \
+  --root /home/igarashi_25/datasets/cityscapes \
+  --result_dir /home/igarashi_25/playground_2/CSDFM/CFM/result/V3_aug/unet_align015_aug_256×512_200ep \
+  --num_classes 20 \
+  --image_size 256 512 \
+  --epochs 200 \
+  --batch_size 4 \
+  --num_workers 8 \
+  --backbone unet \
+  --lr 5e-5 \
+  --source_lr 5e-6 \
+  --optimizer adamw \
+  --weight_decay 1e-4 \
+  --grad_clip 1.0 \
+  --warmup_epochs 10 \
+  --eta_min 5e-7 \
+  --resume_eta_min 1e-8 \
+  --amp \
+  --amp_dtype bf16 \
+  --eta 0.5 \
+  --lambda_distill 1.0 \
+  --lambda_td 1.0 \
+  --eps 0.05 \
+  --label_smoothing 0.0 \
+  --prior_type image_gaussian \
+  --distill_loss psd \
+  --prior_noise_std 1.0 \
+  --use_loss_align \
+  --align_weight 0.15 \
+  --var_weight 0.0 \
+  --align_eps 1e-8 \
+  --source_backbone segformer \
+  --source_segformer_variant b3 \
+  --source_pretrained \
+  --source_decoder_channels 256 \
+  --source_fixed_std 1.0 \
+  --source_mu_tanh_scale 0.0 \
+  --fusion_channels 128 \
+  --rrdb_blocks 10 \
+  --rrdb_growth_channels 32 \
+  --rrdb_blocks_mask 3 \
+  --rrdb_growth_channels_mask 16 \
+  --unet_base_channels 64 \
+  --unet_channel_mults 1,2,4,8,8 \
+  --num_res_blocks 2 \
+  --time_emb_dim 512 \
+  --attn_levels 3,4 \
+  --dropout 0.0 \
+  --num_heads 4 \
+  --val_eval_epochs 50,150,200,300,500,600,800 \
+  --val_eval_split val \
+  --val_eval_num_steps 1 \
+  --use_ccdm_aug \
+  --hflip_prob 0.5 \
+  --color_jitter_brightness 0.2 \
+  --color_jitter_contrast 0.2 \
+  --color_jitter_saturation 0.2 \
+  --color_jitter_hue 0.1 \
+  --use_wandb \
+  --wandb_project CFM \
+  --wandb_name unet-align015-aug-128x256-200epv2 \
+  --wandb_mode online \
+  --wandb_log_interval 50
+
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=3 \
+uv run python /home/igarashi_25/playground_2/CSDFM/CFM/src/segv3_aug/main.py \
+  --root /home/igarashi_25/datasets/cityscapes \
+  --result_dir /home/igarashi_25/playground_2/CSDFM/CFM/result/V3_aug/unet_align015_aug_256×512_200ep \
+  --num_classes 20 \
+  --image_size 256 512 \
+  --epochs 200 \
+  --batch_size 4 \
+  --num_workers 8 \
+  --backbone unet \
+  --lr 5e-5 \
+  --source_lr 5e-6 \
+  --optimizer adamw \
+  --weight_decay 1e-4 \
+  --grad_clip 1.0 \
+  --warmup_epochs 10 \
+  --eta_min 5e-7 \
+  --resume_eta_min 1e-8 \
+  --amp \
+  --amp_dtype bf16 \
+  --eta 0.5 \
+  --lambda_distill 1.0 \
+  --lambda_td 1.0 \
+  --eps 0.05 \
+  --label_smoothing 0.0 \
+  --prior_type image_gaussian \
+  --distill_loss psd \
+  --prior_noise_std 1.0 \
+  --use_loss_align \
+  --align_weight 0.15 \
+  --var_weight 0.0 \
+  --align_eps 1e-8 \
+  --source_backbone segformer \
+  --source_segformer_variant b3 \
+  --source_pretrained \
+  --source_decoder_channels 256 \
+  --source_fixed_std 1.0 \
+  --source_mu_tanh_scale 0.0 \
+  --fusion_channels 128 \
+  --rrdb_blocks 10 \
+  --rrdb_growth_channels 32 \
+  --rrdb_blocks_mask 3 \
+  --rrdb_growth_channels_mask 16 \
+  --unet_base_channels 64 \
+  --unet_channel_mults 1,2,4,8,8 \
+  --num_res_blocks 2 \
+  --time_emb_dim 512 \
+  --attn_levels 3,4 \
+  --dropout 0.0 \
+  --num_heads 4 \
+  --val_eval_epochs 50,150,200,300,500,600,800 \
+  --val_eval_split val \
+  --val_eval_num_steps 1 \
+  --use_ccdm_aug \
+  --hflip_prob 0.5 \
+  --color_jitter_brightness 0.2 \
+  --color_jitter_contrast 0.2 \
+  --color_jitter_saturation 0.2 \
+  --color_jitter_hue 0.1 \
+  --use_wandb \
+  --wandb_project CFM \
+  --wandb_name unet-align015-aug-128x256-200epv2 \
+  --wandb_mode online \
+  --wandb_log_interval 50
+
+
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_VISIBLE_DEVICES=3 \
+uv run python /home/igarashi_25/playground_2/CSDFM/CFM/src/segv3_aug/main.py \
+  --root /home/igarashi_25/datasets/cityscapes \
+  --result_dir /home/igarashi_25/playground_2/CSDFM/CFM/result/V3_aug/unet_small_b0_rrdb5_align015_aug_256x512_800ep \
+  --num_classes 20 \
+  --image_size 256 512 \
+  --epochs 800 \
+  --batch_size 4 \
+  --grad_accum_steps 1 \
+  --num_workers 8 \
+  --backbone unet \
+  --lr 1e-4 \
+  --source_lr 1e-5 \
+  --optimizer adamw \
+  --weight_decay 1e-3 \
+  --grad_clip 1.0 \
+  --warmup_epochs 10 \
+  --eta_min 5e-7 \
+  --resume_eta_min 1e-8 \
+  --amp \
+  --amp_dtype bf16 \
+  --eta 0.5 \
+  --lambda_distill 1.0 \
+  --lambda_td 1.0 \
+  --eps 0.05 \
+  --label_smoothing 0.0 \
+  --prior_type image_gaussian \
+  --distill_loss psd \
+  --prior_noise_std 1.0 \
+  --use_loss_align \
+  --align_weight 0.15 \
+  --var_weight 0.0 \
+  --align_eps 1e-8 \
+  --source_backbone segformer \
+  --source_segformer_variant b1 \
+  --source_pretrained \
+  --source_decoder_channels 256 \
+  --source_fixed_std 1.0 \
+  --source_mu_tanh_scale 0.0 \
+  --fusion_channels 128 \
+  --rrdb_blocks 3 \
+  --rrdb_growth_channels 32 \
+  --rrdb_blocks_mask 3 \
+  --rrdb_growth_channels_mask 16 \
+  --unet_base_channels 45 \
+  --unet_channel_mults 1,2,4,4,8 \
+  --num_res_blocks 2 \
+  --time_emb_dim 512 \
+  --attn_levels 3,4 \
+  --dropout 0.0 \
+  --num_heads 4 \
+  --val_eval_epochs 75,150,200,300,500,600,800 \
+  --val_eval_split val \
+  --val_eval_num_steps 1 \
+  --use_ccdm_aug \
+  --hflip_prob 0.5 \
+  --color_jitter_brightness 0.2 \
+  --color_jitter_contrast 0.2 \
+  --color_jitter_saturation 0.2 \
+  --color_jitter_hue 0.1 \
+  --use_wandb \
+  --wandb_project CFM \
+  --wandb_name unet-small-b0-rrdb5-align015-aug-256x512-800ep \
+  --wandb_mode online \
+  --wandb_log_interval 50
