@@ -364,6 +364,9 @@ class CategoricalFlowMaps:
             img=img,
             source_net=source_net,
         )
+        if return_intermediates:
+            pred_traj.append(x.argmax(dim=1).cpu())
+
         image_feat = model.encode_image(img)
         ts = torch.linspace(0.03, 1.0, num_steps + 1, device=img.device)
 

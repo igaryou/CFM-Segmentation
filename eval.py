@@ -6,12 +6,13 @@ from pathlib import Path
 from typing import Dict
 
 import torch
+from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import Cityscapes20ClassDataset
 from main import (
-    DEVICE,
+    #DEVICE,
     autocast_context,
     build_cfm,
     build_model,
@@ -22,9 +23,9 @@ from main import (
     normalize_args,
     parse_wandb_tags,
 )
-from visualization import save_trajectory_grid
+from visualization import colorize_mask, save_trajectory_grid
 
-
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 class SegmentationMetrics:
     def __init__(
         self,
@@ -153,6 +154,11 @@ def resolve_eval_amp_args(args: argparse.Namespace, train_args: argparse.Namespa
     return args
 
 
+def save_colored_mask(mask: torch.Tensor, save_path: Path) -> None:
+    colored_mask = colorize_mask(mask.detach().cpu())
+    Image.fromarray(colored_mask).save(save_path)
+
+
 @torch.no_grad()
 def evaluate(args: argparse.Namespace) -> None:
     result_dir = Path(args.result_dir)
@@ -210,22 +216,22 @@ def evaluate(args: argparse.Namespace) -> None:
         result_dir
         / f"eval_{args.split}_{args.num_steps}steps_{backbone_tag}_{endpoint_tag}_{std_tag}_{cfg_tag}_{size_tag}"
     )
-    vis_dir = save_dir / "visualizations"
+    samples_dir = save_dir / "samples"
     save_dir.mkdir(parents=True, exist_ok=True)
-    vis_dir.mkdir(parents=True, exist_ok=True)
+    samples_dir.mkdir(parents=True, exist_ok=True)
 
-    model = build_model(train_args)
+    model = build_model(train_args, DEVICE)
     load_model_state_dict_compat(model, ckpt["model"])
     model.eval()
 
-    source_net = build_source_net(train_args)
+    source_net = build_source_net(train_args, DEVICE)
     if source_net is not None:
         if "source_net" not in ckpt:
             raise RuntimeError("prior_type='image_gaussian' requires source_net state in checkpoint.")
         source_net.load_state_dict(ckpt["source_net"])
         source_net.eval()
 
-    cfm = build_cfm(train_args)
+    cfm = build_cfm(train_args, DEVICE)
     dataset = Cityscapes20ClassDataset(
         root=train_args.root,
         split=args.split,
@@ -256,7 +262,7 @@ def evaluate(args: argparse.Namespace) -> None:
             img = img.to(DEVICE, non_blocking=True)
             gt_mask = gt_mask.to(DEVICE, non_blocking=True)
 
-            with autocast_context(args):
+            with autocast_context(args, DEVICE):
                 traj = cfm.sample(
                     model=model,
                     img=img,
@@ -273,15 +279,28 @@ def evaluate(args: argparse.Namespace) -> None:
             remaining = max(0, args.num_visualize - visualized)
             if remaining > 0:
                 take = min(remaining, img.size(0))
+                final_pred = traj[-1]
                 for i in range(take):
-                    save_path = vis_dir / f"{args.split}_batch{batch_idx:04d}_idx{i:02d}.png"
+                    global_idx = batch_idx * args.batch_size + i
+                    sample_dir = samples_dir / f"idx{global_idx:06d}"
+                    sample_dir.mkdir(parents=True, exist_ok=True)
+
+                    trajectory_path = sample_dir / "trajectory.png"
                     save_trajectory_grid(
-                        img=img[i].cpu(),
-                        gt=gt_mask[i].cpu(),
-                        traj=traj[:, i].cpu(),
-                        save_path=save_path,
+                        img=img[i].detach().cpu(),
+                        gt=gt_mask[i].detach().cpu(),
+                        traj=traj[:, i].detach().cpu(),
+                        save_path=trajectory_path,
                         num_snap_points=args.num_snap_points,
                         imagenet_normalize=getattr(train_args, "imagenet_normalize", False),
+                    )
+                    save_colored_mask(
+                        gt_mask[i],
+                        sample_dir / "gt_mask.png",
+                    )
+                    save_colored_mask(
+                        final_pred[i],
+                        sample_dir / "final_mask.png",
                     )
                     if (
                         wandb is not None
@@ -290,8 +309,8 @@ def evaluate(args: argparse.Namespace) -> None:
                     ):
                         wandb_images.append(
                             wandb.Image(
-                                str(save_path),
-                                caption=f"{args.split}/batch_{batch_idx}/sample_{i}",
+                                str(trajectory_path),
+                                caption=f"{args.split}/idx_{global_idx}",
                             )
                         )
                 visualized += take

@@ -87,7 +87,7 @@ def snap_indices(num_frames: int, num_snap_points: int) -> List[int]:
     if num_frames <= 1:
         return [0]
     if num_snap_points <= 1:
-        return [num_frames - 1]
+        return [0, num_frames - 1]
     idxs = torch.linspace(0, num_frames - 1, steps=num_snap_points)
     idxs = torch.round(idxs).to(torch.int64).tolist()
     out = []
@@ -125,7 +125,7 @@ def save_trajectory_grid(
 
     for j, tidx in enumerate(snap_ids, start=2):
         axes[j].imshow(colorize_mask(traj[tidx]))
-        axes[j].set_title(f"pred_t{tidx}")
+        axes[j].set_title("initial" if tidx == 0 else f"pred_t{tidx}")
         axes[j].axis("off")
 
     plt.tight_layout()

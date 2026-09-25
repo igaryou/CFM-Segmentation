@@ -21,7 +21,6 @@ from eval import (
     resolve_eval_amp_args,
 )
 from main import (
-    DEVICE,
     autocast_context,
     build_cfm,
     build_model,
@@ -34,7 +33,7 @@ from visualization import colorize_mask, image_to_numpy
 PROB_SUM_ATOL = 5e-3
 CITYSCAPES_VOID_IGNORE_INDEX = 19
 CITYSCAPES_VOID_CLASS_NAME = "void"
-
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class SegmentationMetricsIgnoreVoid:
     def __init__(self, model_num_classes: int, ignore_index: int = 19) -> None:
@@ -650,18 +649,18 @@ def evaluate(args: argparse.Namespace) -> None:
     if args.save_all_predictions:
         pred_dir.mkdir(parents=True, exist_ok=True)
 
-    model = build_model(train_args)
+    model = build_model(train_args, DEVICE)
     load_model_state_dict_compat(model, ckpt["model"])
     model.eval()
 
-    source_net = build_source_net(train_args)
+    source_net = build_source_net(train_args, DEVICE)
     if source_net is not None:
         if "source_net" not in ckpt:
             raise RuntimeError("prior_type='image_gaussian' requires source_net state in checkpoint.")
         source_net.load_state_dict(ckpt["source_net"])
         source_net.eval()
 
-    cfm = build_cfm(train_args)
+    cfm = build_cfm(train_args, DEVICE)
     dataset = Cityscapes20ClassDataset(
         root=train_args.root,
         split=args.split,
@@ -743,7 +742,7 @@ def evaluate(args: argparse.Namespace) -> None:
             visual_ensemble_preds: Dict[int, torch.Tensor] = {}
             visual_entropy_maps: Dict[int, torch.Tensor] = {}
 
-            with autocast_context(args):
+            with autocast_context(args, DEVICE):
                 image_feat = model.encode_image(img)
                 source_stats = compute_source_stats(
                     cfm=cfm,
