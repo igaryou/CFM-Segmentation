@@ -34,9 +34,12 @@ class SegmentationMetrics:
     ) -> None:
         self.num_classes = num_classes  # 20
         self.ignore_index = ignore_index
+        if self.ignore_index != self.num_classes - 1:
+            raise ValueError("Cityscapes void must be the final model class")
+        self.evaluated_num_classes = self.num_classes - 1
         self.confmat = torch.zeros(
-            num_classes,
-            num_classes,
+            self.evaluated_num_classes,
+            self.evaluated_num_classes,
             dtype=torch.int64,
         )
 
@@ -49,25 +52,28 @@ class SegmentationMetrics:
         pred = pred.reshape(-1).cpu()
         target = target.reshape(-1).cpu()
 
-        valid = (
+        valid_target = (
             (target >= 0)
             & (target < self.num_classes)
             & (target != self.ignore_index)
-            & (pred >= 0)
-            & (pred < self.num_classes)
         )
+        invalid_pred = valid_target & (
+            (pred < 0) | (pred >= self.evaluated_num_classes)
+        )
+        if invalid_pred.any():
+            raise RuntimeError("evaluation prediction contains void or an invalid class")
 
-        pred = pred[valid]
-        target = target[valid]
+        pred = pred[valid_target]
+        target = target[valid_target]
 
-        idx = target * self.num_classes + pred
+        idx = target * self.evaluated_num_classes + pred
         bins = torch.bincount(
             idx,
-            minlength=self.num_classes ** 2,
+            minlength=self.evaluated_num_classes ** 2,
         )
         self.confmat += bins.reshape(
-            self.num_classes,
-            self.num_classes,
+            self.evaluated_num_classes,
+            self.evaluated_num_classes,
         )
 
     def compute(self):
@@ -81,12 +87,9 @@ class SegmentationMetrics:
         iou = tp / union.clamp_min(1.0)
         acc_cls = tp / gt.clamp_min(1.0)
 
-        # void=19を平均対象から除外
-        evaluated = torch.arange(self.num_classes) != self.ignore_index
-
         pixel_acc = tp.sum() / conf.sum().clamp_min(1.0)
-        miou = iou[evaluated].mean()
-        macc = acc_cls[evaluated].mean()
+        miou = iou.mean()
+        macc = acc_cls.mean()
 
         return {
             "pixel_acc": float(pixel_acc.item()),
@@ -94,16 +97,14 @@ class SegmentationMetrics:
             "mAcc": float(macc.item()),
             "IoU_per_class": [
                 float(iou[k].item())
-                for k in range(self.num_classes)
-                if k != self.ignore_index
+                for k in range(self.evaluated_num_classes)
             ],
             "Acc_per_class": [
                 float(acc_cls[k].item())
-                for k in range(self.num_classes)
-                if k != self.ignore_index
+                for k in range(self.evaluated_num_classes)
             ],
             "confusion_matrix": conf.to(torch.int64).tolist(),
-            "evaluated_classes": 19,
+            "evaluated_classes": self.evaluated_num_classes,
             "ignore_index": self.ignore_index,
         }
 
@@ -272,6 +273,7 @@ def evaluate(args: argparse.Namespace) -> None:
                     use_cfg=args.use_cfg,
                     cfg_scale=args.cfg_scale,
                     cfg_null_condition=args.cfg_null_condition,
+                    exclude_void=True,
                 )
             pred = traj[-1]
             metrics.update(pred, gt_mask)

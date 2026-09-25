@@ -48,9 +48,11 @@ class SegmentationMetricsIgnoreVoid:
             cls for cls in range(self.model_num_classes) if cls != self.ignore_index
         ]
         self.evaluated_num_classes = len(self.evaluated_classes)
+        if self.ignore_index != self.model_num_classes - 1:
+            raise ValueError("Cityscapes void must be the final model class")
         self.confmat = torch.zeros(
-            self.model_num_classes,
-            self.model_num_classes,
+            self.evaluated_num_classes,
+            self.evaluated_num_classes,
             dtype=torch.int64,
         )
 
@@ -58,30 +60,35 @@ class SegmentationMetricsIgnoreVoid:
     def update(self, pred: torch.Tensor, target: torch.Tensor) -> None:
         pred = pred.view(-1).cpu().long()
         target = target.view(-1).cpu().long()
-        valid = (
+        valid_target = (
             (target >= 0)
             & (target < self.model_num_classes)
             & (target != self.ignore_index)
-            & (pred >= 0)
-            & (pred < self.model_num_classes)
         )
-        pred = pred[valid]
-        target = target[valid]
-        idx = target * self.model_num_classes + pred
-        bins = torch.bincount(idx, minlength=self.model_num_classes ** 2)
-        self.confmat += bins.reshape(self.model_num_classes, self.model_num_classes)
+        invalid_pred = valid_target & (
+            (pred < 0) | (pred >= self.evaluated_num_classes)
+        )
+        if invalid_pred.any():
+            raise RuntimeError("evaluation prediction contains void or an invalid class")
+        pred = pred[valid_target]
+        target = target[valid_target]
+        idx = target * self.evaluated_num_classes + pred
+        bins = torch.bincount(idx, minlength=self.evaluated_num_classes ** 2)
+        self.confmat += bins.reshape(
+            self.evaluated_num_classes,
+            self.evaluated_num_classes,
+        )
 
     def compute(self) -> Dict[str, object]:
         conf = self.confmat.float()
-        eval_idx = torch.tensor(self.evaluated_classes, dtype=torch.long)
         tp = conf.diag()
         gt = conf.sum(dim=1)
         pred = conf.sum(dim=0)
         union = gt + pred - tp
 
-        iou = tp[eval_idx] / union[eval_idx].clamp_min(1.0)
-        acc_cls = tp[eval_idx] / gt[eval_idx].clamp_min(1.0)
-        pixel_acc = tp[eval_idx].sum() / conf[eval_idx, :].sum().clamp_min(1.0)
+        iou = tp / union.clamp_min(1.0)
+        acc_cls = tp / gt.clamp_min(1.0)
+        pixel_acc = tp.sum() / conf.sum().clamp_min(1.0)
         miou = iou.mean()
         macc = acc_cls.mean()
         return {
@@ -370,11 +377,8 @@ def sample_final_probs(
 def probs_to_mask(
     probs: torch.Tensor,
     mode: str,
+    exclude_void: bool = False,
 ) -> torch.Tensor:
-    if mode == "argmax":
-        return probs.argmax(dim=1)
-    if mode != "sample":
-        raise ValueError(f"unsupported prediction mode: {mode}")
     if probs.ndim != 4:
         raise ValueError(
             f"probs must have shape [B, K, H, W], got {tuple(probs.shape)}"
@@ -383,6 +387,16 @@ def probs_to_mask(
     B, K, H, W = probs.shape
     if K <= 0:
         raise ValueError("probs must contain at least one class")
+    if exclude_void:
+        if K < 2:
+            raise ValueError("exclude_void=True requires at least two classes")
+        probs = probs[:, : K - 1]
+        K -= 1
+
+    if mode == "argmax":
+        return probs.argmax(dim=1)
+    if mode != "sample":
+        raise ValueError(f"unsupported prediction mode: {mode}")
 
     safe_probs = probs.float()
     safe_probs = torch.nan_to_num(
@@ -787,6 +801,7 @@ def evaluate(args: argparse.Namespace) -> None:
                     pred_mask = probs_to_mask(
                         probs,
                         mode=args.prediction_mode,
+                        exclude_void=True,
                     )
                     if args.prediction_mode == "sample":
                         if running_votes is None:
@@ -823,14 +838,20 @@ def evaluate(args: argparse.Namespace) -> None:
                     if current_n in sample_count_set:
                         mean_probs = running_prob_sum / float(current_n)
                         if args.prediction_mode == "argmax":
-                            ensemble_pred = mean_probs.argmax(dim=1)
+                            ensemble_pred = cfm.decode_prediction(
+                                mean_probs,
+                                exclude_void=True,
+                            )
                         elif args.prediction_mode == "sample":
                             if running_votes is None:
                                 raise RuntimeError(
                                     "running_votes is required when "
                                     "prediction_mode='sample'"
                                 )
-                            ensemble_pred = running_votes.argmax(dim=1).long()
+                            ensemble_pred = cfm.decode_prediction(
+                                running_votes,
+                                exclude_void=True,
+                            ).long()
                         else:
                             raise ValueError(
                                 "unsupported prediction mode: "
@@ -936,8 +957,8 @@ def evaluate(args: argparse.Namespace) -> None:
             "checkpoint": str(ckpt_path),
             "save_dir": str(save_dir),
             "cfm_sample_return": {
-                "return_intermediates_true": "[T,B,H,W] hard class indices from x.argmax(dim=1).cpu()",
-                "return_intermediates_false": "[B,H,W] hard class indices from x.argmax(dim=1)",
+                "return_intermediates_true": "[T,B,H,W] hard class indices decoded with void excluded for evaluation",
+                "return_intermediates_false": "[B,H,W] hard class indices decoded with void excluded for evaluation",
                 "probability_tensor_used_here": (
                     "final-step pi = softmax(logits, dim=1), shape [B,K,H,W]; "
                     "at t_next=1.0, CFM flow_map makes x equal to this pi."

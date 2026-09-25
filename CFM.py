@@ -188,6 +188,24 @@ class CategoricalFlowMaps:
         gamma = self.gamma(s, t)[:, None, None, None]
         return x_s + gamma * (pi_st - x_s)
 
+    def decode_prediction(
+        self,
+        x: torch.Tensor,
+        exclude_void: bool = False,
+    ) -> torch.Tensor:
+        """Decode a state while retaining the full internal class space."""
+        if x.ndim != 4:
+            raise ValueError(f"x must have shape [B, K, H, W], got {tuple(x.shape)}")
+        if x.shape[1] != self.num_classes:
+            raise ValueError(
+                f"x has {x.shape[1]} class channels, expected {self.num_classes}"
+            )
+        if exclude_void:
+            if self.num_classes < 2:
+                raise ValueError("exclude_void=True requires at least two classes")
+            x = x[:, : self.num_classes - 1]
+        return x.argmax(dim=1)
+
     def vfm_loss(
         self,
         model,
@@ -350,6 +368,7 @@ class CategoricalFlowMaps:
         use_cfg: bool = False,
         cfg_scale: float = 1.0,
         cfg_null_condition: str = "learned",
+        exclude_void: bool = False,
     ):
         device = img.device
         B, _, H, W = img.shape
@@ -365,7 +384,9 @@ class CategoricalFlowMaps:
             source_net=source_net,
         )
         if return_intermediates:
-            pred_traj.append(x.argmax(dim=1).cpu())
+            pred_traj.append(
+                self.decode_prediction(x, exclude_void=exclude_void).cpu()
+            )
 
         image_feat = model.encode_image(img)
         ts = torch.linspace(0.03, 1.0, num_steps + 1, device=img.device)
@@ -413,12 +434,14 @@ class CategoricalFlowMaps:
                 x = x / x.sum(dim=1, keepdim=True).clamp_min(1e-8)
 
             if return_intermediates:
-                pred_traj.append(x.argmax(dim=1).cpu())
+                pred_traj.append(
+                    self.decode_prediction(x, exclude_void=exclude_void).cpu()
+                )
 
         if return_intermediates:
             return torch.stack(pred_traj, dim=0)
 
-        return x.argmax(dim=1)
+        return self.decode_prediction(x, exclude_void=exclude_void)
 
     @torch.no_grad()
     def run_inference_examples(
@@ -481,6 +504,7 @@ class CategoricalFlowMaps:
             use_cfg=use_cfg,
             cfg_scale=cfg_scale,
             cfg_null_condition=cfg_null_condition,
+            exclude_void=True,
         ).cpu()
 
         img = img.cpu()

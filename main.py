@@ -885,20 +885,40 @@ def consistency_component_payload(
 
 
 class SegmentationMetrics:
-    def __init__(self, num_classes: int) -> None:
+    def __init__(self, num_classes: int, ignore_index: Optional[int] = None) -> None:
         self.num_classes = num_classes
-        self.confmat = torch.zeros(num_classes, num_classes, dtype=torch.int64)
+        self.ignore_index = ignore_index
+        if self.ignore_index is not None and self.ignore_index != self.num_classes - 1:
+            raise ValueError("ignored evaluation class must be the final model class")
+        self.evaluated_num_classes = (
+            self.num_classes if self.ignore_index is None else self.num_classes - 1
+        )
+        self.confmat = torch.zeros(
+            self.evaluated_num_classes,
+            self.evaluated_num_classes,
+            dtype=torch.int64,
+        )
 
     @torch.no_grad()
     def update(self, pred: torch.Tensor, target: torch.Tensor) -> None:
         pred = pred.view(-1).cpu()
         target = target.view(-1).cpu()
-        valid = (target >= 0) & (target < self.num_classes)
-        pred = pred[valid]
-        target = target[valid]
-        idx = target * self.num_classes + pred
-        bins = torch.bincount(idx, minlength=self.num_classes ** 2)
-        self.confmat += bins.reshape(self.num_classes, self.num_classes)
+        valid_target = (target >= 0) & (target < self.num_classes)
+        if self.ignore_index is not None:
+            valid_target &= target != self.ignore_index
+        invalid_pred = valid_target & (
+            (pred < 0) | (pred >= self.evaluated_num_classes)
+        )
+        if invalid_pred.any():
+            raise RuntimeError("evaluation prediction contains an invalid class")
+        pred = pred[valid_target]
+        target = target[valid_target]
+        idx = target * self.evaluated_num_classes + pred
+        bins = torch.bincount(idx, minlength=self.evaluated_num_classes ** 2)
+        self.confmat += bins.reshape(
+            self.evaluated_num_classes,
+            self.evaluated_num_classes,
+        )
 
     def compute(self) -> Dict[str, object]:
         conf = self.confmat.float()
@@ -1010,7 +1030,10 @@ def evaluate_val_metrics(
         generator=loader_generator,
     )
 
-    metrics = SegmentationMetrics(num_classes=args.num_classes)
+    metrics = SegmentationMetrics(
+        num_classes=args.num_classes,
+        ignore_index=args.num_classes - 1,
+    )
 
     for img, _, gt_mask in tqdm(
         loader,
@@ -1030,6 +1053,7 @@ def evaluate_val_metrics(
                 use_cfg=args.use_cfg,
                 cfg_scale=args.cfg_scale,
                 cfg_null_condition=args.cfg_null_condition,
+                exclude_void=True,
             )
 
         metrics.update(pred, gt_mask)

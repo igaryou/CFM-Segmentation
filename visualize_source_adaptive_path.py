@@ -118,7 +118,9 @@ def adaptive_path(
 
 
 def state_to_mask(x: torch.Tensor) -> torch.Tensor:
-    return x.argmax(dim=1)
+    if x.ndim != 4 or x.shape[1] < 2:
+        raise ValueError(f"x must have shape [B, K>=2, H, W], got {tuple(x.shape)}")
+    return x[:, :-1].argmax(dim=1)
 
 
 def save_trajectory(
@@ -143,12 +145,12 @@ def save_trajectory(
         ("GT", gt.cpu(), False),
         (
             "Source argmax(mu)",
-            mu.argmax(dim=1)[0].cpu(),
+            state_to_mask(mu)[0].cpu(),
             False,
         ),
         (
             "x0 = mu + sigma eps",
-            x0.argmax(dim=1)[0].cpu(),
+            state_to_mask(x0)[0].cpu(),
             False,
         ),
     ]
@@ -160,7 +162,7 @@ def save_trajectory(
         panels.append(
             (
                 f"t={t:g}",
-                xt.argmax(dim=1)[0].cpu(),
+                state_to_mask(xt)[0].cpu(),
                 False,
             )
         )
@@ -241,7 +243,7 @@ def save_scheduler(
 
     axes[1].imshow(
         colorize_mask(
-            mu.argmax(dim=1)[0].cpu()
+            state_to_mask(mu)[0].cpu()
         )
     )
     axes[1].set_title("Source")

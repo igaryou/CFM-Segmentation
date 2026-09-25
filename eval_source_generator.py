@@ -12,6 +12,7 @@ from PIL import Image
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from CFM import CategoricalFlowMaps
 from dataset import Cityscapes20ClassDataset
 from eval import init_wandb, load_train_config, resolve_eval_amp_args
 from main import DEVICE, autocast_context, build_source_net
@@ -23,7 +24,7 @@ CITYSCAPES_NUM_CLASSES = 20
 
 
 class SegmentationMetricsIgnoreVoid:
-    """Twenty-class confusion matrix with Cityscapes void GT ignored."""
+    """Cityscapes 19-class confusion matrix with void GT ignored."""
 
     def __init__(self, model_num_classes: int, ignore_index: int = 19) -> None:
         self.model_num_classes = int(model_num_classes)
@@ -37,9 +38,11 @@ class SegmentationMetricsIgnoreVoid:
             cls for cls in range(self.model_num_classes) if cls != self.ignore_index
         ]
         self.evaluated_num_classes = len(self.evaluated_classes)
+        if self.ignore_index != self.model_num_classes - 1:
+            raise ValueError("Cityscapes void must be the final model class")
         self.confmat = torch.zeros(
-            self.model_num_classes,
-            self.model_num_classes,
+            self.evaluated_num_classes,
+            self.evaluated_num_classes,
             dtype=torch.int64,
         )
 
@@ -47,33 +50,36 @@ class SegmentationMetricsIgnoreVoid:
     def update(self, pred: torch.Tensor, target: torch.Tensor) -> None:
         pred = pred.reshape(-1).cpu().long()
         target = target.reshape(-1).cpu().long()
-        valid = (
+        valid_target = (
             (target >= 0)
             & (target < self.model_num_classes)
             & (target != self.ignore_index)
-            & (pred >= 0)
-            & (pred < self.model_num_classes)
         )
-        pred = pred[valid]
-        target = target[valid]
+        invalid_pred = valid_target & (
+            (pred < 0) | (pred >= self.evaluated_num_classes)
+        )
+        if invalid_pred.any():
+            raise RuntimeError("evaluation prediction contains void or an invalid class")
+        pred = pred[valid_target]
+        target = target[valid_target]
 
-        # A valid GT pixel predicted as void remains in column 19 and therefore
-        # contributes a false negative to its GT class.
-        idx = target * self.model_num_classes + pred
-        bins = torch.bincount(idx, minlength=self.model_num_classes**2)
-        self.confmat += bins.reshape(self.model_num_classes, self.model_num_classes)
+        idx = target * self.evaluated_num_classes + pred
+        bins = torch.bincount(idx, minlength=self.evaluated_num_classes**2)
+        self.confmat += bins.reshape(
+            self.evaluated_num_classes,
+            self.evaluated_num_classes,
+        )
 
     def compute(self) -> Dict[str, object]:
         conf = self.confmat.to(torch.float64)
-        eval_idx = torch.tensor(self.evaluated_classes, dtype=torch.long)
         tp = conf.diag()
         gt_count = conf.sum(dim=1)
         pred_count = conf.sum(dim=0)
         union = gt_count + pred_count - tp
 
-        iou = tp[eval_idx] / union[eval_idx].clamp_min(1.0)
-        acc_cls = tp[eval_idx] / gt_count[eval_idx].clamp_min(1.0)
-        pixel_acc = tp[eval_idx].sum() / conf[eval_idx, :].sum().clamp_min(1.0)
+        iou = tp / union.clamp_min(1.0)
+        acc_cls = tp / gt_count.clamp_min(1.0)
+        pixel_acc = tp.sum() / conf.sum().clamp_min(1.0)
         return {
             "pixel_acc": float(pixel_acc.item()),
             "mIoU": float(iou.mean().item()),
@@ -379,7 +385,7 @@ def evaluate(args: argparse.Namespace) -> None:
     wandb_config.update(
         {
             "evaluation_target": "source_generator_mu",
-            "prediction_rule": "argmax(mu, dim=1)",
+            "prediction_rule": "argmax(mu[:, :19], dim=1)",
             "eval_image_size": list(eval_image_size),
         }
     )
@@ -388,6 +394,10 @@ def evaluate(args: argparse.Namespace) -> None:
     metrics = SegmentationMetricsIgnoreVoid(
         model_num_classes=train_args.num_classes,
         ignore_index=CITYSCAPES_VOID_IGNORE_INDEX,
+    )
+    prediction_decoder = CategoricalFlowMaps(
+        num_classes=train_args.num_classes,
+        device=DEVICE,
     )
     source_statistics = SourceStatistics(
         num_classes=train_args.num_classes,
@@ -452,7 +462,7 @@ def evaluate(args: argparse.Namespace) -> None:
                 )
 
             # The segmentation class is determined directly in CFM state space.
-            pred = mu.argmax(dim=1)
+            pred = prediction_decoder.decode_prediction(mu, exclude_void=True)
             expected_pred_shape = (
                 img.shape[0],
                 gt_mask.shape[-2],
@@ -520,7 +530,7 @@ def evaluate(args: argparse.Namespace) -> None:
         result.update(
             {
                 "evaluation_target": "source_generator_mu",
-                "prediction_rule": "argmax(mu, dim=1)",
+                "prediction_rule": "argmax(mu[:, :19], dim=1)",
                 "uses_source_noise": False,
                 "uses_cfm_model": False,
                 "uses_flow_sampling": False,
@@ -554,7 +564,7 @@ def evaluate(args: argparse.Namespace) -> None:
         )
         with open(save_dir / "metrics.txt", "w", encoding="utf-8") as file:
             file.write("evaluation target : source_generator mu\n")
-            file.write("prediction rule   : argmax(mu)\n")
+            file.write("prediction rule   : argmax(mu[:, :19])\n")
             file.write("uses source noise : false\n")
             file.write("uses CFM sampling : false\n")
             file.write(f"split             : {args.split}\n")
@@ -588,7 +598,7 @@ def evaluate(args: argparse.Namespace) -> None:
             wandb.log(log_payload)
 
         print("Source-generator evaluation finished.")
-        print("prediction : argmax(mu)")
+        print("prediction : argmax(mu[:, :19])")
         print(f"pixel_acc : {result['pixel_acc']:.6f}")
         print(f"mIoU      : {result['mIoU']:.6f}")
         print(f"mAcc      : {result['mAcc']:.6f}")
